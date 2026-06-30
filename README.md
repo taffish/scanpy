@@ -1,6 +1,6 @@
 # scanpy
 
-TAFFISH wrapper for [Scanpy](https://scanpy.readthedocs.io/) 1.12.1, the
+TAFFISH wrapper for [Scanpy](https://scanpy.readthedocs.io/) 1.12.2, the
 scverse Python toolkit for scalable single-cell gene-expression analysis.
 
 ## Package Identity
@@ -8,10 +8,10 @@ scverse Python toolkit for scalable single-cell gene-expression analysis.
 - name: `scanpy`
 - command: `taf-scanpy`
 - kind: `tool`
-- TAFFISH version: `1.12.1-r1`
-- container image: `ghcr.io/taffish/scanpy:1.12.1-r1`
-- upstream: `scverse/scanpy` tag `1.12.1`
-- runtime: Python 3.12 with Scanpy 1.12.1
+- TAFFISH version: `1.12.2-r1`
+- container image: `ghcr.io/taffish/scanpy:1.12.2-r1`
+- upstream: `scverse/scanpy` tag `1.12.2`
+- runtime: Python 3.12 with Scanpy 1.12.2
 - app license: Apache-2.0
 - upstream license: BSD-3-Clause
 
