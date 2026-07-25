@@ -1,4 +1,4 @@
-scanpy 1.12.2-r1
+scanpy 1.12.3-r1
 
 Purpose:
   Python 3.12 Scanpy runtime and upstream Scanpy CLI for single-cell
@@ -46,7 +46,7 @@ Common output files:
   output paths.
 
 Packaged Python stack:
-  Python 3.12, Scanpy 1.12.2, AnnData, NumPy, SciPy, pandas, h5py,
+  Python 3.12, Scanpy 1.12.3, AnnData, NumPy, SciPy, pandas, h5py,
   scikit-learn, matplotlib, seaborn, statsmodels, UMAP, pynndescent, numba,
   networkx, igraph, leidenalg, and scikit-misc.
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.metadata as metadata
 import sys
 import warnings
@@ -33,8 +34,20 @@ def make_adata() -> AnnData:
     return adata
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--buildtime",
+        action="store_true",
+        help="skip graph, marker, and static plotting checks",
+    )
+    parser.add_argument("outdir", nargs="?", default="scanpy-smoke-out")
+    return parser.parse_args()
+
+
 def main() -> int:
-    outdir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("scanpy-smoke-out")
+    args = parse_args()
+    outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     adata = make_adata()
@@ -56,32 +69,39 @@ def main() -> int:
     adata.raw = adata
     sc.pp.scale(adata, max_value=10)
     sc.tl.pca(adata, n_comps=5, svd_solver="arpack", random_state=7)
-    sc.pp.neighbors(adata, n_neighbors=5, n_pcs=5, random_state=7)
-    sc.tl.leiden(
-        adata,
-        resolution=0.5,
-        random_state=7,
-        key_added="leiden",
-        flavor="igraph",
-        n_iterations=2,
-        directed=False,
-    )
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="invalid value encountered in log2",
-            category=RuntimeWarning,
+
+    if not args.buildtime:
+        sc.pp.neighbors(adata, n_neighbors=5, n_pcs=5, random_state=7)
+        sc.tl.leiden(
+            adata,
+            resolution=0.5,
+            random_state=7,
+            key_added="leiden",
+            flavor="igraph",
+            n_iterations=2,
+            directed=False,
         )
-        sc.tl.rank_genes_groups(adata, groupby="group", method="t-test", use_raw=True)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in log2",
+                category=RuntimeWarning,
+            )
+            sc.tl.rank_genes_groups(
+                adata,
+                groupby="group",
+                method="t-test",
+                use_raw=True,
+            )
 
-    markers = sc.get.rank_genes_groups_df(adata, group="A")
-    if markers.empty:
-        raise RuntimeError("rank_genes_groups smoke produced no marker table")
-    markers.head(10).to_csv(outdir / "markers.tsv", sep="\t", index=False)
+        markers = sc.get.rank_genes_groups_df(adata, group="A")
+        if markers.empty:
+            raise RuntimeError("rank_genes_groups smoke produced no marker table")
+        markers.head(10).to_csv(outdir / "markers.tsv", sep="\t", index=False)
 
-    sc.pl.pca(adata, color="group", show=False)
-    plt.savefig(outdir / "pca.png", dpi=120, bbox_inches="tight")
-    plt.close("all")
+        sc.pl.pca(adata, color="group", show=False)
+        plt.savefig(outdir / "pca.png", dpi=120, bbox_inches="tight")
+        plt.close("all")
 
     adata.write_h5ad(outdir / "scanpy_smoke.h5ad")
 

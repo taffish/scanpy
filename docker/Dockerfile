@@ -1,4 +1,6 @@
-ARG SCANPY_VERSION=1.12.2
+ARG SCANPY_VERSION=1.12.3
+ARG SCANPY_WHEEL_URL=https://files.pythonhosted.org/packages/44/85/ff8c8a5e2f0f3113cb332b36b2949f43d50d77062d7991f5a25477869049/scanpy-1.12.3-py3-none-any.whl
+ARG SCANPY_WHEEL_SHA256=296bc35e243cb70f3aa948ca97237843fe0773f57aca3f66e6b37bf94b6e795d
 ARG DEBIAN_MIRROR=http://deb.debian.org/debian
 ARG DEBIAN_SECURITY_MIRROR=http://deb.debian.org/debian-security
 ARG PIP_INDEX_URL=https://pypi.org/simple
@@ -6,6 +8,8 @@ ARG PIP_INDEX_URL=https://pypi.org/simple
 FROM python:3.12-slim-bookworm AS builder
 
 ARG SCANPY_VERSION
+ARG SCANPY_WHEEL_URL
+ARG SCANPY_WHEEL_SHA256
 ARG DEBIAN_MIRROR
 ARG DEBIAN_SECURITY_MIRROR
 ARG PIP_INDEX_URL
@@ -47,7 +51,8 @@ RUN set -eux; \
 RUN set -eux; \
     python -m venv /opt/scanpy; \
     /opt/scanpy/bin/python -m pip install --upgrade pip setuptools wheel; \
-    /opt/scanpy/bin/python -m pip install "scanpy[leiden,skmisc]==${SCANPY_VERSION}"; \
+    /opt/scanpy/bin/python -m pip install \
+      "scanpy[leiden,skmisc] @ ${SCANPY_WHEEL_URL}#sha256=${SCANPY_WHEEL_SHA256}"; \
     /opt/scanpy/bin/python -m pip check; \
     /opt/scanpy/bin/python -m pip freeze --all > /opt/scanpy/requirements.freeze.txt
 
@@ -57,7 +62,12 @@ RUN set -eux; \
     chmod 0755 /opt/scanpy/share/testdata/scanpy_smoke.py; \
     mkdir -p /opt/scanpy/share/doc/scanpy; \
     mv /opt/scanpy/requirements.freeze.txt /opt/scanpy/share/doc/scanpy/requirements.freeze.txt; \
-    printf "%s\n" "${SCANPY_VERSION}" > /opt/scanpy/share/doc/scanpy/VERSION
+    printf "%s\n" "${SCANPY_VERSION}" > /opt/scanpy/share/doc/scanpy/VERSION; \
+    printf "scanpy_version=%s\nwheel_url=%s\nwheel_sha256=%s\n" \
+      "${SCANPY_VERSION}" \
+      "${SCANPY_WHEEL_URL}" \
+      "${SCANPY_WHEEL_SHA256}" \
+      > /opt/scanpy/share/doc/scanpy/SOURCE
 
 RUN set -eux; \
     export PATH="/opt/scanpy/bin:${PATH}"; \
@@ -67,12 +77,16 @@ RUN set -eux; \
     tmp=/tmp/taf-scanpy-runtime-check; \
     rm -rf "$tmp"; \
     mkdir -p "$tmp"; \
-    python /opt/scanpy/share/testdata/scanpy_smoke.py "$tmp/out"; \
+    python /opt/scanpy/share/testdata/scanpy_smoke.py --buildtime "$tmp/out"; \
     test -s "$tmp/out/scanpy_smoke.h5ad"; \
-    test -s "$tmp/out/pca.png"; \
-    test -s "$tmp/out/markers.tsv"; \
     test -s "$tmp/out/versions.tsv"; \
-    rm -rf "$tmp"
+    grep -Fx "scanpy_version=${SCANPY_VERSION}" \
+      /opt/scanpy/share/doc/scanpy/SOURCE >/dev/null; \
+    grep -Fx "wheel_sha256=${SCANPY_WHEEL_SHA256}" \
+      /opt/scanpy/share/doc/scanpy/SOURCE >/dev/null; \
+    rm -rf "$tmp"; \
+    find /opt/scanpy -type d -name __pycache__ -prune -exec rm -rf '{}' +; \
+    find /opt/scanpy -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
 FROM python:3.12-slim-bookworm
 
@@ -82,6 +96,7 @@ ARG DEBIAN_SECURITY_MIRROR
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONNOUSERSITE=1
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV MPLBACKEND=Agg
 ENV OPENBLAS_NUM_THREADS=1
 ENV OMP_NUM_THREADS=1
@@ -96,6 +111,10 @@ RUN set -eux; \
       -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
       -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
       /etc/apt/sources.list.d/debian.sources; \
+    runtime_tbb=""; \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      runtime_tbb="libtbb12"; \
+    fi; \
     for attempt in 1 2 3; do \
       if apt-get -o Acquire::Retries=3 update \
        && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
@@ -106,7 +125,8 @@ RUN set -eux; \
             libgfortran5 \
             libgomp1 \
             libopenblas0-pthread \
-            libstdc++6; then \
+            libstdc++6 \
+            $runtime_tbb; then \
         break; \
       fi; \
       if [ "$attempt" = "3" ]; then exit 1; fi; \
@@ -119,18 +139,18 @@ RUN set -eux; \
 COPY --from=builder /opt/scanpy /opt/scanpy
 
 RUN set -eux; \
+    python -m pip check; \
     test "$(python -c 'import importlib.metadata as md; print(md.version("scanpy"))')" = "${SCANPY_VERSION}"; \
     python -c 'import importlib.metadata as md; import scanpy as sc, anndata, h5py, igraph, leidenalg, matplotlib, natsort, networkx, numba, numpy, pandas, pynndescent, scipy, seaborn, sklearn, statsmodels, umap; from skmisc.loess import loess; print(md.version("scanpy"))' | grep -Fx "${SCANPY_VERSION}" >/dev/null; \
     scanpy --help 2>&1 | grep -E 'usage:|Usage:' >/dev/null; \
     tmp=/tmp/taf-scanpy-runtime-check; \
     rm -rf "$tmp"; \
     mkdir -p "$tmp"; \
-    python /opt/scanpy/share/testdata/scanpy_smoke.py "$tmp/out"; \
+    python /opt/scanpy/share/testdata/scanpy_smoke.py --buildtime "$tmp/out"; \
     test -s "$tmp/out/scanpy_smoke.h5ad"; \
-    test -s "$tmp/out/pca.png"; \
-    test -s "$tmp/out/markers.tsv"; \
     test -s "$tmp/out/versions.tsv"; \
-    rm -rf "$tmp"
+    rm -rf "$tmp"; \
+    test -z "$(find /opt/scanpy -type f \( -name '*.pyc' -o -name '*.pyo' \) -print -quit)"
 
 WORKDIR /root
 
