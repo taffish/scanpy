@@ -1,0 +1,1380 @@
+#!/usr/bin/env python3
+"""Prepare selected Scanpy example datasets with verified shared-safe semantics."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import http.client
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import sys
+import tempfile
+import time
+from typing import BinaryIO
+import urllib.error
+import urllib.request
+
+
+APP_RELEASE = "1.12.4-r1"
+SCANPY_VERSION = "1.12.4"
+CATALOG_PATH = Path(
+    os.environ.get(
+        "TAFFISH_SCANPY_DATASET_CATALOG",
+        "/opt/scanpy/share/scanpy/dataset-catalog.json",
+    )
+)
+CATALOG_SHA256 = "7ec2711c801966b85eafae96857a166a70dbc8921a9094b627d65d9aad5f70fd"
+INSTALL_MOUNT = Path("/dataset-install")
+DEFAULT_DATASET_ROOT = INSTALL_MOUNT / SCANPY_VERSION
+RUNTIME_DATASET_ROOT = Path("/datasets/scanpy")
+ROOT_MANIFEST = "TAFFISH_DATASET_MANIFEST.json"
+ROOT_INVENTORY = "TAFFISH_DATASET_INVENTORY.tsv"
+ROOT_READY = "TAFFISH_DATASET_READY"
+CONTROL_DIR = ".taffish"
+MEMBER_DIR = "datasets"
+INVENTORY_HEADER = "dataset_id\tsha256\tbytes\trelative_path\n"
+DATASET_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+AUTOMATIC = "automatic-download-or-verified-local-file"
+LOCAL_ONLY = "authorized-local-import-only"
+USER_AGENT = f"taffish-scanpy/{APP_RELEASE} dataset-preparer"
+
+
+class ResourceError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    dataset_id: str
+    relative_path: str
+    url: str
+    expected_bytes: int
+    sha256: str
+    acquisition: str
+    resource_license: dict
+
+
+@dataclass
+class VerifiedSource:
+    path: Path
+    handle: BinaryIO
+    source_bytes: int
+    source_sha256: str
+
+    def close(self) -> None:
+        self.handle.close()
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def json_bytes(value: object) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+
+def require_regular_or_absent(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ResourceError(f"{label} must be a non-symlink regular file: {path}")
+
+
+def require_safe_regular_or_absent(path: Path, root: Path, label: str) -> None:
+    """Reject symlinks and non-directories in every component below root."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ResourceError(f"{label} escapes the prepared root: {path}") from error
+    require_directory(root, "prepared dataset root")
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ResourceError(
+                f"{label} path contains a symlink or non-directory: {current}"
+            )
+    require_regular_or_absent(path, label)
+
+
+def require_directory(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise ResourceError(f"{label} does not exist: {path}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ResourceError(f"{label} must be a non-symlink directory: {path}")
+
+
+def reject_walk_error(error: OSError) -> None:
+    raise ResourceError(
+        f"unable to inspect prepared-root entry {error.filename}: {error}"
+    ) from error
+
+
+def require_no_symlinks(root: Path) -> None:
+    require_directory(root, "prepared dataset root")
+    for current, directories, filenames in os.walk(
+        root,
+        topdown=True,
+        onerror=reject_walk_error,
+        followlinks=False,
+    ):
+        current_path = Path(current)
+        for name in directories + filenames:
+            candidate = current_path / name
+            try:
+                metadata = candidate.lstat()
+            except FileNotFoundError as error:
+                raise ResourceError(
+                    f"prepared-root entry changed during symlink validation: {candidate}"
+                ) from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ResourceError(f"prepared dataset root contains a symlink: {candidate}")
+
+
+def require_known_tree(
+    root: Path,
+    entries: dict[str, CatalogEntry],
+    member_ids: set[str] | None = None,
+) -> None:
+    allowed_files = {
+        Path(ROOT_MANIFEST),
+        Path(ROOT_INVENTORY),
+        Path(ROOT_READY),
+    }
+    allowed_directories = {Path("."), Path(CONTROL_DIR), Path(CONTROL_DIR) / MEMBER_DIR}
+    for entry in entries.values():
+        if member_ids is not None and entry.dataset_id not in member_ids:
+            continue
+        data_path = Path(*PurePosixPath(entry.relative_path).parts)
+        allowed_files.add(data_path)
+        allowed_files.add(Path(CONTROL_DIR) / MEMBER_DIR / f"{entry.dataset_id}.json")
+        allowed_files.add(Path(CONTROL_DIR) / MEMBER_DIR / f"{entry.dataset_id}.ready")
+        parent = data_path.parent
+        while parent != Path("."):
+            allowed_directories.add(parent)
+            parent = parent.parent
+
+    for current, directories, filenames in os.walk(
+        root,
+        topdown=True,
+        onerror=reject_walk_error,
+        followlinks=False,
+    ):
+        current_path = Path(current)
+        relative_current = current_path.relative_to(root)
+        relative_current = Path(".") if not relative_current.parts else relative_current
+        if relative_current not in allowed_directories:
+            raise ResourceError(f"unknown prepared-root directory: {current_path}")
+        for name in directories:
+            candidate = (relative_current / name) if relative_current != Path(".") else Path(name)
+            if candidate not in allowed_directories:
+                raise ResourceError(f"unknown prepared-root directory: {root / candidate}")
+        for name in filenames:
+            candidate = (relative_current / name) if relative_current != Path(".") else Path(name)
+            if candidate not in allowed_files:
+                raise ResourceError(f"unknown prepared-root file: {root / candidate}")
+
+
+def require_source_path(path: Path) -> None:
+    if not path.is_absolute():
+        raise ResourceError("--source-file must be an absolute container path")
+    try:
+        relative = path.relative_to(INSTALL_MOUNT)
+    except ValueError as error:
+        raise ResourceError(
+            "--source-file must be inside the mounted /dataset-install parent"
+        ) from error
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ResourceError(
+            "--source-file must stay inside the mounted /dataset-install parent"
+        )
+    current = INSTALL_MOUNT
+    require_directory(current, "dataset install mount")
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError as error:
+            raise ResourceError(f"--source-file does not exist: {path}") from error
+        final = index == len(relative.parts) - 1
+        expected = stat.S_ISREG(metadata.st_mode) if final else stat.S_ISDIR(metadata.st_mode)
+        if not expected:
+            raise ResourceError(
+                f"--source-file path contains a symlink or wrong file type: {current}"
+            )
+
+
+def valid_receipt_source(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    source = PurePosixPath(value)
+    if not source.is_absolute() or str(source) != value:
+        return False
+    try:
+        relative = source.relative_to(PurePosixPath(str(INSTALL_MOUNT)))
+    except ValueError:
+        return False
+    return bool(relative.parts) and not any(
+        part in {"", ".", ".."} for part in relative.parts
+    )
+
+
+def open_lock(path: Path) -> BinaryIO:
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o644)
+    except OSError as error:
+        raise ResourceError(f"unable to open non-symlink installation lock: {path}: {error}") from error
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ResourceError(f"installation lock is not a regular file: {path}")
+    os.fchmod(descriptor, 0o644)
+    return os.fdopen(descriptor, "r+b")
+
+
+def safe_mkdir(path: Path, stop: Path) -> None:
+    if not path.is_absolute() or not stop.is_absolute():
+        raise ResourceError("internal directory paths must be absolute")
+    try:
+        relative = path.relative_to(stop)
+    except ValueError as error:
+        raise ResourceError(f"directory escapes its prepared root: {path}") from error
+    require_directory(stop, "prepared-root parent")
+    current = stop
+    for part in relative.parts:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o755)
+            metadata = current.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ResourceError(f"directory path contains a symlink or non-directory: {current}")
+        current.chmod(0o755)
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write(path: Path, content: bytes, mode: int = 0o644) -> None:
+    require_regular_or_absent(path, "metadata target")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.tmp-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), mode)
+        require_regular_or_absent(path, "metadata target")
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def parse_ready(path: Path) -> dict[str, str]:
+    require_regular_or_absent(path, "READY receipt")
+    if not path.is_file():
+        raise ResourceError(f"READY receipt is missing: {path}")
+    result: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or "=" not in line:
+            raise ResourceError(f"malformed READY receipt line in {path}")
+        key, value = line.split("=", 1)
+        if not key or key in result:
+            raise ResourceError(f"duplicate or empty READY key in {path}: {key}")
+        result[key] = value
+    return result
+
+
+def load_catalog(path: Path = CATALOG_PATH) -> tuple[dict, dict[str, CatalogEntry]]:
+    try:
+        raw = path.read_bytes()
+        catalog = json.loads(raw)
+    except (OSError, ValueError) as error:
+        raise ResourceError(f"unable to read packaged dataset catalog: {error}") from error
+    if sha256_bytes(raw) != CATALOG_SHA256:
+        raise ResourceError("packaged dataset catalog SHA256 is inconsistent")
+    if catalog.get("schema") != "taffish.scanpy.dataset-catalog.v1":
+        raise ResourceError("packaged dataset catalog schema is not recognized")
+    if catalog.get("app_release") != APP_RELEASE:
+        raise ResourceError("packaged dataset catalog app release is inconsistent")
+    if catalog.get("scanpy_version") != SCANPY_VERSION:
+        raise ResourceError("packaged dataset catalog Scanpy version is inconsistent")
+    raw_entries = catalog.get("datasets")
+    if not isinstance(raw_entries, list) or len(raw_entries) != 5:
+        raise ResourceError("packaged dataset catalog must contain exactly five members")
+
+    entries: dict[str, CatalogEntry] = {}
+    for raw_entry in raw_entries:
+        try:
+            entry = CatalogEntry(
+                dataset_id=raw_entry["id"],
+                relative_path=raw_entry["relative_path"],
+                url=raw_entry["url"],
+                expected_bytes=raw_entry["expected_bytes"],
+                sha256=raw_entry["sha256"],
+                acquisition=raw_entry["acquisition"],
+                resource_license=raw_entry["resource_license"],
+            )
+        except (KeyError, TypeError) as error:
+            raise ResourceError(f"malformed packaged dataset entry: {error}") from error
+        if not DATASET_ID.fullmatch(entry.dataset_id):
+            raise ResourceError(f"unsafe packaged dataset ID: {entry.dataset_id}")
+        relative = PurePosixPath(entry.relative_path)
+        if relative.is_absolute() or not relative.parts or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise ResourceError(f"unsafe packaged dataset path: {entry.relative_path}")
+        if not entry.url.startswith("https://exampledata.scverse.org/scanpy/"):
+            raise ResourceError(f"unexpected packaged dataset URL: {entry.dataset_id}")
+        if not isinstance(entry.expected_bytes, int) or entry.expected_bytes <= 0:
+            raise ResourceError(f"invalid packaged byte size: {entry.dataset_id}")
+        if not SHA256.fullmatch(entry.sha256):
+            raise ResourceError(f"invalid packaged SHA256: {entry.dataset_id}")
+        if entry.acquisition not in {AUTOMATIC, LOCAL_ONLY}:
+            raise ResourceError(f"invalid acquisition policy: {entry.dataset_id}")
+        if not isinstance(entry.resource_license, dict) or not entry.resource_license:
+            raise ResourceError(f"missing resource-license policy: {entry.dataset_id}")
+        if entry.dataset_id in entries:
+            raise ResourceError(f"duplicate packaged dataset ID: {entry.dataset_id}")
+        entries[entry.dataset_id] = entry
+
+    expected_ids = {
+        "burczynski06",
+        "moignard15",
+        "paul15",
+        "pbmc3k-processed",
+        "pbmc3k-raw",
+    }
+    if set(entries) != expected_ids:
+        raise ResourceError("packaged dataset catalog member set is inconsistent")
+    return catalog, entries
+
+
+def resolve_entry(selectors: list[str] | None, entries: dict[str, CatalogEntry]) -> CatalogEntry:
+    if selectors is None or len(selectors) != 1:
+        raise ResourceError("installation requires exactly one --dataset DATASET_ID")
+    selector = selectors[0]
+    if selector in {"all", "latest"} or any(
+        marker in selector for marker in ("*", "?", "[", "]", ",", "@latest")
+    ):
+        raise ResourceError(
+            f"selector is not one exact catalog member: {selector}; use --list-datasets"
+        )
+    try:
+        return entries[selector]
+    except KeyError as error:
+        raise ResourceError(
+            f"unknown Scanpy {SCANPY_VERSION} dataset: {selector}; use --list-datasets"
+        ) from error
+
+
+def nearest_existing(path: Path) -> Path:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    if not candidate.exists():
+        raise ResourceError(f"cannot determine filesystem capacity for {path}")
+    return candidate
+
+
+def required_free_bytes(entry: CatalogEntry, minimum_gb: float) -> int:
+    return max(int(minimum_gb * 1024**3), entry.expected_bytes * 3)
+
+
+def require_free_space(path: Path, entry: CatalogEntry, minimum_gb: float) -> None:
+    required = required_free_bytes(entry, minimum_gb)
+    free = shutil.disk_usage(nearest_existing(path)).free
+    if free < required:
+        raise ResourceError(
+            f"insufficient free space: require {required} bytes, found {free} bytes"
+        )
+
+
+def is_container_mount(path: Path) -> bool:
+    try:
+        for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if len(fields) > 4 and fields[4] == str(path):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def require_install_root(root: Path) -> Path:
+    if os.environ.get("TAFFISH_SCANPY_DATASET_INSTALL_MOUNTED") != "1":
+        raise ResourceError(
+            "refusing a non-persistent install: set "
+            "TAFFISH_SCANPY_DATASET_INSTALL_ROOT on the host so the wrapper mounts "
+            "/dataset-install"
+        )
+    require_directory(INSTALL_MOUNT, "dataset install mount")
+    if not is_container_mount(INSTALL_MOUNT):
+        raise ResourceError(
+            "refusing a non-persistent install: /dataset-install is not a bind or volume mount"
+        )
+    for marker in (ROOT_MANIFEST, ROOT_INVENTORY, ROOT_READY, CONTROL_DIR):
+        candidate = INSTALL_MOUNT / marker
+        if candidate.exists() or candidate.is_symlink():
+            raise ResourceError(
+                "TAFFISH_SCANPY_DATASET_INSTALL_ROOT must be the parent of the "
+                "version root, not a prepared root or one of its descendants"
+            )
+    if not root.is_absolute():
+        raise ResourceError("installation --dataset-root must be absolute")
+    normalized = Path(os.path.abspath(root))
+    if normalized != DEFAULT_DATASET_ROOT:
+        raise ResourceError(
+            f"installation --dataset-root must be {DEFAULT_DATASET_ROOT}, found {normalized}"
+        )
+    try:
+        metadata = normalized.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ResourceError(f"installation version root must not be a symlink: {normalized}")
+    return normalized
+
+
+def source_snapshot(source: Path, staged: Path, entry: CatalogEntry) -> VerifiedSource:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as error:
+        raise ResourceError(f"unable to open source as a non-symlink file: {source}: {error}") from error
+    handle = os.fdopen(descriptor, "rb")
+    try:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ResourceError(f"source is not a regular file: {source}")
+        digest = hashlib.sha256()
+        total = 0
+        with staged.open("xb") as output:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                output.write(chunk)
+                digest.update(chunk)
+                total += len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+            os.fchmod(output.fileno(), 0o644)
+        after = os.fstat(handle.fileno())
+        stable = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        actual_sha256 = digest.hexdigest()
+        if not stable:
+            raise ResourceError(f"source changed while it was being copied: {source}")
+        if total != entry.expected_bytes:
+            raise ResourceError(
+                f"source byte size mismatch for {entry.dataset_id}: "
+                f"expected {entry.expected_bytes}, found {total}"
+            )
+        if actual_sha256 != entry.sha256:
+            raise ResourceError(
+                f"source SHA256 mismatch for {entry.dataset_id}: "
+                f"expected {entry.sha256}, found {actual_sha256}"
+            )
+        handle.seek(0)
+        return VerifiedSource(source, handle, total, actual_sha256)
+    except BaseException:
+        handle.close()
+        staged.unlink(missing_ok=True)
+        raise
+
+
+def validate_cached_file(path: Path, entry: CatalogEntry) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ResourceError(f"download cache must be a non-symlink regular file: {path}")
+    return metadata.st_size == entry.expected_bytes and sha256_file(path) == entry.sha256
+
+
+def download_entry(entry: CatalogEntry, cache_dir: Path, force: bool) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.chmod(0o755)
+    cached = cache_dir / f"{entry.dataset_id}.source"
+    partial = cache_dir / f"{entry.dataset_id}.part"
+    if validate_cached_file(cached, entry):
+        return cached
+    if cached.exists():
+        if not force:
+            raise ResourceError(
+                f"cached source is corrupt; rerun with --force after review: {cached}"
+            )
+        require_regular_or_absent(cached, "download cache")
+        cached.unlink()
+
+    require_regular_or_absent(partial, "partial download")
+    if force and partial.exists():
+        partial.unlink()
+        fsync_directory(cache_dir)
+    if partial.exists() and partial.stat().st_size == entry.expected_bytes:
+        if sha256_file(partial) == entry.sha256:
+            os.replace(partial, cached)
+            cached.chmod(0o644)
+            fsync_directory(cache_dir)
+            return cached
+        raise ResourceError(
+            f"complete-size partial download has the wrong SHA256; "
+            f"rerun with --force after review: {partial}"
+        )
+    if partial.exists() and partial.stat().st_size > entry.expected_bytes:
+        if not force:
+            raise ResourceError(
+                f"partial download is larger than expected; rerun with --force: {partial}"
+            )
+        partial.unlink()
+
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        start = partial.stat().st_size if partial.exists() else 0
+        headers = {"User-Agent": USER_AGENT}
+        if start:
+            headers["Range"] = f"bytes={start}-"
+        request = urllib.request.Request(entry.url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                status = getattr(response, "status", response.getcode())
+                mode = "ab"
+                if start and status != 206:
+                    start = 0
+                    mode = "wb"
+                elif start:
+                    content_range = response.headers.get("Content-Range", "")
+                    if not content_range.startswith(f"bytes {start}-"):
+                        raise ResourceError(
+                            f"download server returned an inconsistent Content-Range "
+                            f"for {entry.dataset_id}: {content_range!r}"
+                        )
+                elif not start:
+                    mode = "wb"
+                with partial.open(mode) as output:
+                    if mode == "wb":
+                        os.fchmod(output.fileno(), 0o644)
+                    total = start
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        total += len(chunk)
+                        if total > entry.expected_bytes:
+                            raise ResourceError(
+                                f"download exceeded expected size for {entry.dataset_id}"
+                            )
+                    output.flush()
+                    os.fsync(output.fileno())
+            if partial.stat().st_size == entry.expected_bytes:
+                break
+            last_error = ResourceError(
+                f"download is incomplete for {entry.dataset_id}: "
+                f"{partial.stat().st_size}/{entry.expected_bytes} bytes"
+            )
+        except http.client.IncompleteRead as error:
+            tail = error.partial
+            if tail:
+                require_regular_or_absent(partial, "partial download")
+                current_size = partial.stat().st_size if partial.exists() else 0
+                if current_size + len(tail) > entry.expected_bytes:
+                    raise ResourceError(
+                        f"incomplete response exceeded expected size for {entry.dataset_id}"
+                    ) from error
+                with partial.open("ab") as output:
+                    output.write(tail)
+                    output.flush()
+                    os.fsync(output.fileno())
+            last_error = error
+        except (
+            OSError,
+            http.client.HTTPException,
+            urllib.error.URLError,
+            ResourceError,
+        ) as error:
+            last_error = error
+        if attempt < 3:
+            time.sleep(attempt)
+    else:
+        raise ResourceError(f"download failed after three attempts: {last_error}")
+
+    if partial.stat().st_size != entry.expected_bytes:
+        raise ResourceError(f"download did not reach the expected size: {partial}")
+    actual_sha256 = sha256_file(partial)
+    if actual_sha256 != entry.sha256:
+        raise ResourceError(
+            f"download SHA256 mismatch for {entry.dataset_id}: "
+            f"expected {entry.sha256}, found {actual_sha256}; partial retained for review"
+        )
+    os.replace(partial, cached)
+    cached.chmod(0o644)
+    fsync_directory(cache_dir)
+    return cached
+
+
+def member_paths(root: Path, entry: CatalogEntry) -> tuple[Path, Path, Path]:
+    destination = root.joinpath(*PurePosixPath(entry.relative_path).parts)
+    member_root = root / CONTROL_DIR / MEMBER_DIR
+    manifest = member_root / f"{entry.dataset_id}.json"
+    ready = member_root / f"{entry.dataset_id}.ready"
+    return destination, manifest, ready
+
+
+def acquisition_receipt(
+    entry: CatalogEntry,
+    source: Path,
+    source_file_supplied: bool,
+    authorization_confirmed: bool,
+) -> dict:
+    if source_file_supplied:
+        mode = "authorized-local-file-import" if entry.acquisition == LOCAL_ONLY else "verified-local-file-import"
+        source_identity = str(source)
+    else:
+        mode = "automatic-verified-download"
+        source_identity = entry.url
+    return {
+        "mode": mode,
+        "observed_at": now_utc(),
+        "source": source_identity,
+        "source_bytes": entry.expected_bytes,
+        "source_sha256": entry.sha256,
+        "authorization": {
+            "confirmation_required": entry.acquisition == LOCAL_ONLY,
+            "confirmed_by_caller": authorization_confirmed,
+            "confirmation_flag": (
+                "--confirm-authorized-local-import"
+                if authorization_confirmed
+                else None
+            ),
+        },
+    }
+
+
+def member_manifest(entry: CatalogEntry, receipt: dict) -> dict:
+    return {
+        "schema": "taffish.scanpy.dataset-member-manifest.v1",
+        "app_release": APP_RELEASE,
+        "scanpy_version": SCANPY_VERSION,
+        "catalog_sha256": CATALOG_SHA256,
+        "dataset": {
+            "id": entry.dataset_id,
+            "relative_path": entry.relative_path,
+            "url": entry.url,
+            "expected_bytes": entry.expected_bytes,
+            "sha256": entry.sha256,
+            "acquisition_policy": entry.acquisition,
+            "resource_license": entry.resource_license,
+        },
+        "acquisition_receipt": receipt,
+        "installed_files": [
+            {
+                "relative_path": entry.relative_path,
+                "bytes": entry.expected_bytes,
+                "sha256": entry.sha256,
+            }
+        ],
+    }
+
+
+def member_ready_bytes(entry: CatalogEntry, manifest_content: bytes) -> bytes:
+    return (
+        "schema=taffish.scanpy.dataset-member-ready.v1\n"
+        f"app_release={APP_RELEASE}\n"
+        f"scanpy_version={SCANPY_VERSION}\n"
+        f"catalog_sha256={CATALOG_SHA256}\n"
+        f"dataset_id={entry.dataset_id}\n"
+        f"relative_path={entry.relative_path}\n"
+        f"bytes={entry.expected_bytes}\n"
+        f"sha256={entry.sha256}\n"
+        f"manifest_sha256={sha256_bytes(manifest_content)}\n"
+    ).encode()
+
+
+def verify_member(root: Path, entry: CatalogEntry, deep: bool) -> dict:
+    destination, manifest_path, ready_path = member_paths(root, entry)
+    require_safe_regular_or_absent(destination, root, "installed dataset")
+    require_safe_regular_or_absent(manifest_path, root, "member manifest")
+    require_safe_regular_or_absent(ready_path, root, "member READY receipt")
+    if not destination.is_file() or not manifest_path.is_file() or not ready_path.is_file():
+        raise ResourceError(f"dataset member is incomplete: {entry.dataset_id}")
+    metadata = destination.stat()
+    if metadata.st_size != entry.expected_bytes:
+        raise ResourceError(f"installed byte size mismatch: {entry.dataset_id}")
+    if deep and sha256_file(destination) != entry.sha256:
+        raise ResourceError(f"installed SHA256 mismatch: {entry.dataset_id}")
+    try:
+        manifest_raw = manifest_path.read_bytes()
+        manifest = json.loads(manifest_raw)
+    except (OSError, ValueError) as error:
+        raise ResourceError(f"invalid member manifest for {entry.dataset_id}: {error}") from error
+    if manifest.get("schema") != "taffish.scanpy.dataset-member-manifest.v1":
+        raise ResourceError(f"member manifest schema mismatch: {entry.dataset_id}")
+    if manifest.get("app_release") != APP_RELEASE or manifest.get("scanpy_version") != SCANPY_VERSION:
+        raise ResourceError(f"member version identity mismatch: {entry.dataset_id}")
+    if manifest.get("catalog_sha256") != CATALOG_SHA256:
+        raise ResourceError(f"member catalog identity mismatch: {entry.dataset_id}")
+    dataset = manifest.get("dataset")
+    expected_dataset = {
+        "id": entry.dataset_id,
+        "relative_path": entry.relative_path,
+        "url": entry.url,
+        "expected_bytes": entry.expected_bytes,
+        "sha256": entry.sha256,
+        "acquisition_policy": entry.acquisition,
+        "resource_license": entry.resource_license,
+    }
+    if dataset != expected_dataset:
+        raise ResourceError(f"member catalog fields mismatch: {entry.dataset_id}")
+    expected_files = [
+        {
+            "relative_path": entry.relative_path,
+            "bytes": entry.expected_bytes,
+            "sha256": entry.sha256,
+        }
+    ]
+    if manifest.get("installed_files") != expected_files:
+        raise ResourceError(f"member file inventory mismatch: {entry.dataset_id}")
+    receipt = manifest.get("acquisition_receipt")
+    if not isinstance(receipt, dict):
+        raise ResourceError(f"member acquisition receipt is missing: {entry.dataset_id}")
+    expected_receipt_keys = {
+        "mode",
+        "observed_at",
+        "source",
+        "source_bytes",
+        "source_sha256",
+        "authorization",
+    }
+    if set(receipt) != expected_receipt_keys:
+        raise ResourceError(f"member acquisition receipt fields mismatch: {entry.dataset_id}")
+    if receipt.get("source_bytes") != entry.expected_bytes:
+        raise ResourceError(f"member receipt byte size mismatch: {entry.dataset_id}")
+    if receipt.get("source_sha256") != entry.sha256:
+        raise ResourceError(f"member receipt SHA256 mismatch: {entry.dataset_id}")
+    observed_at = receipt.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.endswith("Z"):
+        raise ResourceError(f"member receipt timestamp is malformed: {entry.dataset_id}")
+    authorization = receipt.get("authorization")
+    if not isinstance(authorization, dict):
+        raise ResourceError(f"member authorization receipt is missing: {entry.dataset_id}")
+    if set(authorization) != {
+        "confirmation_required",
+        "confirmed_by_caller",
+        "confirmation_flag",
+    }:
+        raise ResourceError(f"member authorization receipt fields mismatch: {entry.dataset_id}")
+    if entry.acquisition == LOCAL_ONLY:
+        if receipt.get("mode") != "authorized-local-file-import":
+            raise ResourceError(f"local-import receipt mode mismatch: {entry.dataset_id}")
+        if not valid_receipt_source(receipt.get("source")):
+            raise ResourceError(f"local-import receipt source mismatch: {entry.dataset_id}")
+        expected_authorization = {
+            "confirmation_required": True,
+            "confirmed_by_caller": True,
+            "confirmation_flag": "--confirm-authorized-local-import",
+        }
+    else:
+        if receipt.get("mode") == "automatic-verified-download":
+            if receipt.get("source") != entry.url:
+                raise ResourceError(f"download receipt source mismatch: {entry.dataset_id}")
+        elif receipt.get("mode") == "verified-local-file-import":
+            if not valid_receipt_source(receipt.get("source")):
+                raise ResourceError(f"local-file receipt source mismatch: {entry.dataset_id}")
+        else:
+            raise ResourceError(f"automatic-resource receipt mode mismatch: {entry.dataset_id}")
+        expected_authorization = {
+            "confirmation_required": False,
+            "confirmed_by_caller": False,
+            "confirmation_flag": None,
+        }
+    if authorization != expected_authorization:
+        raise ResourceError(f"member authorization receipt mismatch: {entry.dataset_id}")
+    ready = parse_ready(ready_path)
+    expected_ready = {
+        "schema": "taffish.scanpy.dataset-member-ready.v1",
+        "app_release": APP_RELEASE,
+        "scanpy_version": SCANPY_VERSION,
+        "catalog_sha256": CATALOG_SHA256,
+        "dataset_id": entry.dataset_id,
+        "relative_path": entry.relative_path,
+        "bytes": str(entry.expected_bytes),
+        "sha256": entry.sha256,
+        "manifest_sha256": sha256_bytes(manifest_raw),
+    }
+    if ready != expected_ready:
+        raise ResourceError(f"member READY receipt mismatch: {entry.dataset_id}")
+    return {
+        "dataset_id": entry.dataset_id,
+        "sha256": entry.sha256,
+        "bytes": entry.expected_bytes,
+        "relative_path": entry.relative_path,
+        "manifest_sha256": sha256_bytes(manifest_raw),
+        "acquisition_mode": receipt.get("mode"),
+        "resource_license": entry.resource_license,
+    }
+
+
+def installed_members(root: Path, entries: dict[str, CatalogEntry], deep: bool) -> list[dict]:
+    member_root = root / CONTROL_DIR / MEMBER_DIR
+    if member_root.exists():
+        require_directory(member_root, "member metadata directory")
+        expected_names = {
+            name
+            for dataset_id in entries
+            for name in (f"{dataset_id}.json", f"{dataset_id}.ready")
+        }
+        for child in member_root.iterdir():
+            if child.name not in expected_names:
+                raise ResourceError(f"unknown member metadata entry: {child}")
+    records: list[dict] = []
+    for dataset_id in sorted(entries):
+        entry = entries[dataset_id]
+        destination, manifest, ready = member_paths(root, entry)
+        for path, label in (
+            (destination, "installed dataset"),
+            (manifest, "member manifest"),
+            (ready, "member READY receipt"),
+        ):
+            require_safe_regular_or_absent(path, root, label)
+        if destination.exists() or manifest.exists() or ready.exists():
+            records.append(verify_member(root, entry, deep))
+    return records
+
+
+def inventory_bytes(records: list[dict]) -> bytes:
+    lines = [INVENTORY_HEADER]
+    for record in records:
+        lines.append(
+            f"{record['dataset_id']}\t{record['sha256']}\t{record['bytes']}\t"
+            f"{record['relative_path']}\n"
+        )
+    return "".join(lines).encode()
+
+
+def write_root_metadata(root: Path, records: list[dict]) -> None:
+    if not records:
+        raise ResourceError("refusing to mark an empty dataset root ready")
+    inventory_content = inventory_bytes(records)
+    manifest = {
+        "schema": "taffish.scanpy.dataset-root-manifest.v1",
+        "app_release": APP_RELEASE,
+        "scanpy_version": SCANPY_VERSION,
+        "catalog_sha256": CATALOG_SHA256,
+        "generated_at": now_utc(),
+        "member_count": len(records),
+        "inventory_sha256": sha256_bytes(inventory_content),
+        "members": records,
+    }
+    manifest_content = json_bytes(manifest)
+    ready_content = (
+        "schema=taffish.scanpy.dataset-root-ready.v1\n"
+        f"app_release={APP_RELEASE}\n"
+        f"scanpy_version={SCANPY_VERSION}\n"
+        f"catalog_sha256={CATALOG_SHA256}\n"
+        f"member_count={len(records)}\n"
+        f"inventory_sha256={sha256_bytes(inventory_content)}\n"
+        f"manifest_sha256={sha256_bytes(manifest_content)}\n"
+    ).encode()
+    atomic_write(root / ROOT_INVENTORY, inventory_content)
+    atomic_write(root / ROOT_MANIFEST, manifest_content)
+    atomic_write(root / ROOT_READY, ready_content)
+
+
+def verify_root(root: Path, entries: dict[str, CatalogEntry], deep: bool = True) -> list[dict]:
+    require_directory(root, "prepared dataset root")
+    require_no_symlinks(root)
+    manifest_path = root / ROOT_MANIFEST
+    inventory_path = root / ROOT_INVENTORY
+    ready_path = root / ROOT_READY
+    for path, label in (
+        (manifest_path, "root manifest"),
+        (inventory_path, "root inventory"),
+        (ready_path, "root READY receipt"),
+    ):
+        require_regular_or_absent(path, label)
+        if not path.is_file():
+            raise ResourceError(f"{label} is missing: {path}")
+    records = installed_members(root, entries, deep)
+    if not records:
+        raise ResourceError("prepared dataset root contains no verified members")
+    require_known_tree(
+        root,
+        entries,
+        {record["dataset_id"] for record in records},
+    )
+    expected_inventory = inventory_bytes(records)
+    actual_inventory = inventory_path.read_bytes()
+    if actual_inventory != expected_inventory:
+        raise ResourceError("root inventory does not match verified members")
+    try:
+        manifest_raw = manifest_path.read_bytes()
+        manifest = json.loads(manifest_raw)
+    except (OSError, ValueError) as error:
+        raise ResourceError(f"invalid root manifest: {error}") from error
+    if manifest.get("schema") != "taffish.scanpy.dataset-root-manifest.v1":
+        raise ResourceError("root manifest schema mismatch")
+    if manifest.get("app_release") != APP_RELEASE or manifest.get("scanpy_version") != SCANPY_VERSION:
+        raise ResourceError("root version identity mismatch")
+    if manifest.get("catalog_sha256") != CATALOG_SHA256:
+        raise ResourceError("root catalog identity mismatch")
+    if manifest.get("member_count") != len(records) or manifest.get("members") != records:
+        raise ResourceError("root member inventory mismatch")
+    if manifest.get("inventory_sha256") != sha256_bytes(actual_inventory):
+        raise ResourceError("root manifest inventory hash mismatch")
+    ready = parse_ready(ready_path)
+    expected_ready = {
+        "schema": "taffish.scanpy.dataset-root-ready.v1",
+        "app_release": APP_RELEASE,
+        "scanpy_version": SCANPY_VERSION,
+        "catalog_sha256": CATALOG_SHA256,
+        "member_count": str(len(records)),
+        "inventory_sha256": sha256_bytes(actual_inventory),
+        "manifest_sha256": sha256_bytes(manifest_raw),
+    }
+    if ready != expected_ready:
+        raise ResourceError("root READY receipt mismatch")
+    return records
+
+
+def describe_entry(entry: CatalogEntry) -> str:
+    license_status = entry.resource_license.get("status", "unknown")
+    return (
+        f"dataset={entry.dataset_id}\n"
+        f"acquisition={entry.acquisition}\n"
+        f"url={entry.url}\n"
+        f"bytes={entry.expected_bytes}\n"
+        f"sha256={entry.sha256}\n"
+        f"relative_path={entry.relative_path}\n"
+        f"license_status={license_status}\n"
+    )
+
+
+def install_entry(
+    root: Path,
+    entry: CatalogEntry,
+    entries: dict[str, CatalogEntry],
+    source_file: Path | None,
+    confirm_authorized_local_import: bool,
+    force: bool,
+    minimum_free_gb: float,
+) -> None:
+    root = require_install_root(root)
+    if entry.acquisition == LOCAL_ONLY:
+        if source_file is None:
+            raise ResourceError(
+                f"{entry.dataset_id} is authorized-local-import-only; provide --source-file"
+            )
+        if not confirm_authorized_local_import:
+            raise ResourceError(
+                f"{entry.dataset_id} requires --confirm-authorized-local-import"
+            )
+    elif confirm_authorized_local_import:
+        raise ResourceError(
+            "--confirm-authorized-local-import is only valid for an authorized-local-import-only member"
+        )
+    if (
+        entry.acquisition == AUTOMATIC
+        and source_file is None
+        and os.environ.get("TAFFISH_SCANPY_ALLOW_NETWORK") != "1"
+    ):
+        raise ResourceError(
+            "automatic download requires explicit TAFFISH_SCANPY_ALLOW_NETWORK=1; "
+            "keep TAFFISH_SCANPY_DATASET_INSTALL_ROOT set so the verified result is persistent"
+        )
+    if source_file is not None:
+        require_source_path(source_file)
+        resolved_source = source_file.resolve(strict=False)
+        try:
+            resolved_source.relative_to(root)
+        except ValueError:
+            pass
+        else:
+            raise ResourceError("--source-file must not be inside the prepared version root")
+
+    require_free_space(root, entry, minimum_free_gb)
+    control_parent = INSTALL_MOUNT / ".taffish-scanpy"
+    safe_mkdir(control_parent, INSTALL_MOUNT)
+    locks = control_parent / "locks"
+    staging = control_parent / "staging"
+    cache = control_parent / "cache" / SCANPY_VERSION
+    safe_mkdir(locks, INSTALL_MOUNT)
+    safe_mkdir(staging, INSTALL_MOUNT)
+    safe_mkdir(cache, INSTALL_MOUNT)
+    lock_path = locks / f"scanpy-{SCANPY_VERSION}.lock"
+    require_regular_or_absent(lock_path, "installation lock")
+
+    with open_lock(lock_path) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        safe_mkdir(root, INSTALL_MOUNT)
+        safe_mkdir(root / CONTROL_DIR, root)
+        safe_mkdir(root / CONTROL_DIR / MEMBER_DIR, root)
+        require_no_symlinks(root)
+        require_known_tree(root, entries)
+        destination, manifest_path, ready_path = member_paths(root, entry)
+        member_targets = (destination, manifest_path, ready_path)
+        for path, label in (
+            (destination, "installed dataset"),
+            (manifest_path, "member manifest"),
+            (ready_path, "member READY receipt"),
+        ):
+            require_safe_regular_or_absent(path, root, label)
+        member_present = tuple(path.exists() for path in member_targets)
+        if any(member_present):
+            try:
+                verify_member(root, entry, deep=True)
+            except ResourceError:
+                if not force:
+                    raise ResourceError(
+                        f"existing member is incomplete or corrupt; rerun with --force after review: {entry.dataset_id}"
+                    )
+            else:
+                if not force:
+                    verify_root(root, entries, deep=True)
+                    print(f"already-installed={entry.dataset_id}")
+                    return
+
+        root_metadata = (
+            root / ROOT_INVENTORY,
+            root / ROOT_MANIFEST,
+            root / ROOT_READY,
+        )
+        for path, label in (
+            (root_metadata[0], "root inventory"),
+            (root_metadata[1], "root manifest"),
+            (root_metadata[2], "root READY receipt"),
+        ):
+            require_safe_regular_or_absent(path, root, label)
+        root_state_present = tuple(path.exists() for path in root_metadata)
+        if any(root_state_present):
+            try:
+                verify_root(root, entries, deep=True)
+            except ResourceError:
+                if not force:
+                    raise ResourceError(
+                        "prepared root is incomplete or corrupt; rerun with --force "
+                        "for the affected exact dataset after review"
+                    )
+
+        transaction = Path(tempfile.mkdtemp(prefix="scanpy-txn-", dir=staging))
+        transaction.chmod(0o700)
+        fsync_directory(staging)
+        staged_file = transaction / "dataset.source"
+        verified_source: VerifiedSource | None = None
+        backup_root = transaction / "backup"
+        backup_root.mkdir(mode=0o700)
+        fsync_directory(transaction)
+        transaction_targets = (
+            ("00-dataset", destination),
+            ("01-member-manifest", manifest_path),
+            ("02-member-ready", ready_path),
+            ("03-root-inventory", root / ROOT_INVENTORY),
+            ("04-root-manifest", root / ROOT_MANIFEST),
+            ("05-root-ready", root / ROOT_READY),
+        )
+        backup_plan = {
+            target: backup_root / backup_name
+            for backup_name, target in transaction_targets
+        }
+        originally_present = {
+            target: target.exists()
+            for _, target in transaction_targets
+        }
+        created_destination_parents: list[Path] = []
+        candidate_parent = destination.parent
+        while candidate_parent != root:
+            if not candidate_parent.exists():
+                created_destination_parents.append(candidate_parent)
+            candidate_parent = candidate_parent.parent
+        preserve_transaction = True
+        try:
+            effective_source = source_file
+            if effective_source is None:
+                effective_source = download_entry(entry, cache, force)
+            verified_source = source_snapshot(effective_source, staged_file, entry)
+            receipt = acquisition_receipt(
+                entry,
+                effective_source,
+                source_file is not None,
+                confirm_authorized_local_import,
+            )
+            safe_mkdir(destination.parent, root)
+            for _, target in transaction_targets:
+                require_safe_regular_or_absent(target, root, "transaction target")
+            backup_order = (transaction_targets[-1],) + transaction_targets[:-1]
+            for _, target in backup_order:
+                if originally_present[target]:
+                    backup = backup_plan[target]
+                    os.replace(target, backup)
+                    fsync_directory(target.parent)
+                    fsync_directory(backup_root)
+            os.replace(staged_file, destination)
+            destination.chmod(0o644)
+            fsync_directory(destination.parent)
+            manifest_content = json_bytes(member_manifest(entry, receipt))
+            atomic_write(manifest_path, manifest_content)
+            atomic_write(ready_path, member_ready_bytes(entry, manifest_content))
+            records = installed_members(root, entries, deep=True)
+            write_root_metadata(root, records)
+            verify_root(root, entries, deep=True)
+            preserve_transaction = False
+        except BaseException as install_error:
+            rollback_errors: list[str] = []
+            for _, target in reversed(transaction_targets):
+                try:
+                    backup = backup_plan[target]
+                    if originally_present[target]:
+                        if backup.exists():
+                            if not backup.is_file() or backup.is_symlink():
+                                raise ResourceError(
+                                    f"transaction backup is invalid: {backup}"
+                                )
+                            require_safe_regular_or_absent(
+                                target, root, "rollback target"
+                            )
+                            if target.exists():
+                                target.unlink()
+                                fsync_directory(target.parent)
+                        elif not target.exists():
+                            raise ResourceError(
+                                f"both original target and transaction backup are missing: {target}"
+                            )
+                    else:
+                        require_safe_regular_or_absent(target, root, "rollback target")
+                        if target.exists():
+                            target.unlink()
+                            fsync_directory(target.parent)
+                except BaseException as error:
+                    rollback_errors.append(f"remove replacement {target}: {error}")
+            for _, target in transaction_targets:
+                if not originally_present[target]:
+                    continue
+                backup = backup_plan[target]
+                try:
+                    if not backup.exists():
+                        if target.exists():
+                            continue
+                        raise ResourceError(f"transaction backup is missing: {backup}")
+                    if not backup.is_file() or backup.is_symlink():
+                        raise ResourceError(f"transaction backup is invalid: {backup}")
+                    safe_mkdir(target.parent, root)
+                    require_safe_regular_or_absent(target, root, "rollback target")
+                    os.replace(backup, target)
+                    fsync_directory(target.parent)
+                    fsync_directory(backup_root)
+                except BaseException as error:
+                    rollback_errors.append(f"restore {target}: {error}")
+            for directory in created_destination_parents:
+                try:
+                    try:
+                        metadata = directory.lstat()
+                    except FileNotFoundError:
+                        continue
+                    if not stat.S_ISDIR(metadata.st_mode):
+                        raise ResourceError(
+                            f"transaction-created parent is no longer a directory: {directory}"
+                        )
+                    directory.rmdir()
+                    fsync_directory(directory.parent)
+                except BaseException as error:
+                    rollback_errors.append(
+                        f"remove transaction-created parent {directory}: {error}"
+                    )
+            if rollback_errors:
+                raise ResourceError(
+                    "dataset installation failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from install_error
+            preserve_transaction = False
+            raise
+        finally:
+            if verified_source is not None:
+                verified_source.close()
+            if preserve_transaction:
+                print(
+                    f"scanpy-prepare-datasets: retained failed transaction for recovery: {transaction}",
+                    file=sys.stderr,
+                )
+            else:
+                shutil.rmtree(transaction, ignore_errors=True)
+                fsync_directory(staging)
+        print(f"installed={entry.dataset_id}")
+        print(f"dataset_root={root}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prepare one exact Scanpy 1.12.4 example dataset with fixed identity, "
+            "or verify an existing prepared root."
+        )
+    )
+    parser.add_argument("--dataset", action="append", metavar="DATASET_ID")
+    parser.add_argument("--list-datasets", action="store_true")
+    parser.add_argument("--inventory", action="store_true")
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=None,
+        help=(
+            "prepared version root; installation defaults to /dataset-install/1.12.4, "
+            "verification also accepts a read-only mounted root"
+        ),
+    )
+    parser.add_argument("--source-file", type=Path)
+    parser.add_argument("--confirm-authorized-local-import", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--min-free-gb", type=float, default=0.05)
+    parser.add_argument("--jobs", type=int, choices=(1,), default=1)
+    return parser
+
+
+def validate_mode(args: argparse.Namespace) -> None:
+    informational = int(args.list_datasets) + int(args.inventory) + int(args.verify_only)
+    if informational > 1:
+        raise ResourceError("choose only one of --list-datasets, --inventory, or --verify-only")
+    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+        raise ResourceError("--min-free-gb must be finite and non-negative")
+    if args.list_datasets or args.inventory:
+        if any(
+            (
+                args.dataset,
+                args.dataset_root,
+                args.source_file,
+                args.confirm_authorized_local_import,
+                args.dry_run,
+                args.force,
+            )
+        ):
+            raise ResourceError("catalog listing options do not accept installation arguments")
+    if args.verify_only:
+        if any(
+            (
+                args.dataset,
+                args.source_file,
+                args.confirm_authorized_local_import,
+                args.dry_run,
+                args.force,
+            )
+        ):
+            raise ResourceError("--verify-only does not accept installation arguments")
+
+
+def main() -> int:
+    os.umask(0o022)
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        validate_mode(args)
+        _, entries = load_catalog()
+        if args.list_datasets:
+            for dataset_id in sorted(entries):
+                entry = entries[dataset_id]
+                print(
+                    f"{entry.dataset_id}\t{entry.acquisition}\t"
+                    f"{entry.expected_bytes}\t{entry.relative_path}"
+                )
+            return 0
+        if args.inventory:
+            print(
+                "dataset_id\tacquisition\tbytes\tsha256\trelative_path\turl\tlicense_status"
+            )
+            for dataset_id in sorted(entries):
+                entry = entries[dataset_id]
+                print(
+                    f"{entry.dataset_id}\t{entry.acquisition}\t{entry.expected_bytes}\t"
+                    f"{entry.sha256}\t{entry.relative_path}\t{entry.url}\t"
+                    f"{entry.resource_license.get('status', 'unknown')}"
+                )
+            return 0
+        if args.verify_only:
+            root = args.dataset_root
+            if root is None:
+                runtime = os.environ.get("TAFFISH_SCANPY_DATASET_ROOT")
+                root = Path(runtime) if runtime else DEFAULT_DATASET_ROOT
+            root = Path(os.path.abspath(root))
+            records = verify_root(root, entries, deep=True)
+            print(f"verified_members={len(records)}")
+            print(f"dataset_root={root}")
+            return 0
+
+        entry = resolve_entry(args.dataset, entries)
+        root = Path(os.path.abspath(args.dataset_root or DEFAULT_DATASET_ROOT))
+        if args.dry_run:
+            print(describe_entry(entry), end="")
+            print(f"dataset_root={root}")
+            print(f"required_free_bytes={required_free_bytes(entry, args.min_free_gb)}")
+            print("network_action=none-dry-run")
+            if entry.acquisition == LOCAL_ONLY:
+                print("required=--source-file and --confirm-authorized-local-import")
+            return 0
+        install_entry(
+            root,
+            entry,
+            entries,
+            args.source_file,
+            args.confirm_authorized_local_import,
+            args.force,
+            args.min_free_gb,
+        )
+        return 0
+    except ResourceError as error:
+        print(f"scanpy-prepare-datasets: error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

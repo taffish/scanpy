@@ -1,0 +1,81 @@
+{
+  "schema": "taffish.scanpy.dataset-catalog.v1",
+  "app_release": "1.12.4-r1",
+  "scanpy_version": "1.12.4",
+  "catalog_scope": "Five fixed remote scanpy.datasets members; generated and wheel-bundled datasets are not duplicated here.",
+  "datasets": [
+    {
+      "id": "burczynski06",
+      "relative_path": "burczynski06/GDS1615_full.soft.gz",
+      "url": "https://exampledata.scverse.org/scanpy/GDS1615_full.soft.gz",
+      "expected_bytes": 16295674,
+      "sha256": "86126c1a3c163ea20abb14c1a9711aaff34e6c492ef6dd86298bbaf18cc3f5f3",
+      "acquisition": "automatic-download-or-verified-local-file",
+      "resource_license": {
+        "status": "NCBI-GEO-public-data-with-submitter-rights-caveat",
+        "source_accession": "GDS1615",
+        "evidence_url": "https://www.ncbi.nlm.nih.gov/geo/info/disclaimer.html",
+        "attribution_required": true,
+        "notice": "NCBI places no restrictions on use or distribution of GEO data, but submitters may retain intellectual-property rights. Preserve accession, citation, and source attribution."
+      }
+    },
+    {
+      "id": "moignard15",
+      "relative_path": "moignard15/nbt.3154-S3.xlsx",
+      "url": "https://exampledata.scverse.org/scanpy/41587_2015_BFnbt3154_MOESM4_ESM.xlsx",
+      "expected_bytes": 3402603,
+      "sha256": "e7b358fef2b6da115b7ee3ab4c7fc55fd80e210bba427902e4afc9118992747c",
+      "acquisition": "authorized-local-import-only",
+      "resource_license": {
+        "status": "license-not-established-authorized-local-import-only",
+        "source_reference": "https://www.nature.com/articles/nbt.3154",
+        "automatic_download": false,
+        "site_reuse": "conditional-on-caller-authorization",
+        "notice": "The reviewed source did not establish a general right for TAFFISH to acquire or redistribute this exact supplementary file."
+      }
+    },
+    {
+      "id": "paul15",
+      "relative_path": "paul15/paul15.h5",
+      "url": "https://exampledata.scverse.org/scanpy/paul15.h5",
+      "expected_bytes": 10297693,
+      "sha256": "6161984f758dd464992edc23f1a8ab89b2081600130c6aa93a1ab12b3ada5bfb",
+      "acquisition": "authorized-local-import-only",
+      "resource_license": {
+        "status": "license-not-established-authorized-local-import-only",
+        "source_reference": "https://pubmed.ncbi.nlm.nih.gov/26627738/",
+        "automatic_download": false,
+        "site_reuse": "conditional-on-caller-authorization",
+        "notice": "Scanpy records that this exact derivative was obtained from the laboratory by email; the reviewed sources did not establish general redistribution rights."
+      }
+    },
+    {
+      "id": "pbmc3k-raw",
+      "relative_path": "pbmc3k_raw.h5ad",
+      "url": "https://exampledata.scverse.org/scanpy/pbmc3k_raw.h5ad",
+      "expected_bytes": 5855727,
+      "sha256": "89a96f1beaa2dd83a687666d3f19a4513ac27a2a2d12581fcd77afed7ea653a1",
+      "acquisition": "automatic-download-or-verified-local-file",
+      "resource_license": {
+        "status": "CC-BY-4.0",
+        "source_reference": "https://www.10xgenomics.com/datasets/3-k-pbm-cs-from-a-healthy-donor-1-standard-1-1-0",
+        "attribution_required": true,
+        "notice": "Preserve 10x Genomics source attribution and the CC BY 4.0 license notice."
+      }
+    },
+    {
+      "id": "pbmc3k-processed",
+      "relative_path": "pbmc3k_processed.h5ad",
+      "url": "https://exampledata.scverse.org/scanpy/pbmc3k.h5ad",
+      "expected_bytes": 24653425,
+      "sha256": "0db367b991dd95809732b218539ede489bea99113807f62ebd7ccc970025fe38",
+      "acquisition": "automatic-download-or-verified-local-file",
+      "resource_license": {
+        "status": "CC-BY-4.0",
+        "source_reference": "https://www.10xgenomics.com/datasets/3-k-pbm-cs-from-a-healthy-donor-1-standard-1-1-0",
+        "attribution_required": true,
+        "notice": "Preserve 10x Genomics source attribution and the CC BY 4.0 license notice."
+      }
+    }
+  ]
+}
