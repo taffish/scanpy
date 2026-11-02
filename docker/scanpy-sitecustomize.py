@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import runpy
 import sys
 
 
@@ -46,6 +47,12 @@ def apply_policy() -> None:
         raise RuntimeError(
             f"TAFFISH Scanpy dataset directory is not a persistent container mount: {target}"
         )
+    if target == Path("/datasets/scanpy"):
+        # Host-side checks are an early diagnostic, not a second trust contract.
+        # Use the installer's full catalog/receipt/content validator before analysis.
+        helper = runpy.run_path("/opt/scanpy/bin/scanpy-prepare-datasets")
+        _, entries = helper["load_catalog"]()
+        helper["verify_root"](target, entries, deep=True)
 
     allow_network = os.environ.get("TAFFISH_SCANPY_ALLOW_NETWORK", "0")
     allow_unverified = os.environ.get(

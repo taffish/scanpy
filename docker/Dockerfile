@@ -1,8 +1,12 @@
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579
-ARG SCANPY_VERSION=1.12.4
-ARG SCANPY_UPSTREAM_COMMIT=ff2133115f639fccce9633aa7f5309c36a0972e7
-ARG SCANPY_WHEEL_URL=https://files.pythonhosted.org/packages/6f/5c/b8cd4faf65463e7ba3a78d8dd4f60dab9e1b330eb395bd8f654c3b194b63/scanpy-1.12.4-py3-none-any.whl
-ARG SCANPY_WHEEL_SHA256=a12a7ca9500e4b247fbb5fb9318fb204907125e411183bad3e9c62e5b988f37c
+# Source identity is pinned, but Debian repositories and transitive PyPI dependencies
+# remain live: package availability and resolved dependencies can drift. Retain the
+# image dependency receipt; retry transport failures without changing checksums.
+# This is not a permanent byte-identical rebuild guarantee or an upstream mirror.
+ARG SCANPY_VERSION=1.12.5
+ARG SCANPY_UPSTREAM_COMMIT=02513e1ac31a7e8fb4b0349ff9039cc66812f40c
+ARG SCANPY_WHEEL_URL=https://files.pythonhosted.org/packages/2a/1c/c42cfe80b69b056f5b0210ccc1c4ce40cd696fb12722af74a273d10e49d7/scanpy-1.12.5-py3-none-any.whl
+ARG SCANPY_WHEEL_SHA256=9fc0ce7d113f31d6a5d2f148111375d050d8e88f85e717ec5ebcb443dcdad046
 ARG SKMISC_VERSION=0.5.2
 ARG SKMISC_SDIST_URL=https://files.pythonhosted.org/packages/02/71/d6d2d1710fb56473817b0520212d33874069952dcb417614f6dd24efb51e/scikit_misc-0.5.2.tar.gz
 ARG SKMISC_SDIST_SHA256=49fa30e4051b341edc7422db66a12c0f59d468729285bfe644d10924dc51be0a
@@ -12,10 +16,10 @@ ARG OPENPYXL_WHEEL_SHA256=5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3
 ARG ET_XMLFILE_VERSION=2.0.0
 ARG ET_XMLFILE_WHEEL_URL=https://files.pythonhosted.org/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl
 ARG ET_XMLFILE_WHEEL_SHA256=7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa
-ARG SCANPY_DATASET_CATALOG_SHA256=7ec2711c801966b85eafae96857a166a70dbc8921a9094b627d65d9aad5f70fd
-ARG SCANPY_HELPER_SHA256=f7bfd875c8f068d403206d6affec1ba0effd5b559799c9164bc31415b51596cd
-ARG SCANPY_POLICY_SHA256=6a8cb1a52ee3973f43dce3135c7f4d291f64ea8c023c0b7205387b4c545f4eb4
-ARG SCANPY_SMOKE_SHA256=77bcf120d3e64d0a306050b28c33f834befaa9bb78d7c0be4fdd82c824fc75fe
+ARG SCANPY_DATASET_CATALOG_SHA256=56e6dcacdb9ce3244fbc25e09e9c88a86e0e85dcf6cbef6119e8f5095b398b53
+ARG SCANPY_HELPER_SHA256=efe1e793c04d19de4e60c8cd5f02498dd765b5b3191c9400d0ab9814dbf6973e
+ARG SCANPY_POLICY_SHA256=ceeaab98310c78f745a25faee21ddcee697052f44a60a1c706a205cdc5ac0a9b
+ARG SCANPY_SMOKE_SHA256=24aa9c2db1926721d0f20ef3003302990afe4dcd9bbc2b14f34c91ff8704acc0
 ARG DEBIAN_MIRROR=http://deb.debian.org/debian
 ARG DEBIAN_SECURITY_MIRROR=http://deb.debian.org/debian-security
 ARG PIP_INDEX_URL=https://pypi.org/simple
@@ -106,9 +110,9 @@ RUN set -eux; \
     /opt/scanpy/bin/python -m pip uninstall --yes \
       Cython meson meson-python ninja patchelf pyproject-metadata setuptools wheel; \
     /opt/scanpy/bin/python -m pip check; \
-    test "$(/opt/scanpy/bin/python -c 'import importlib.metadata as md; print(md.version("scikit-misc"))')" = "${SKMISC_VERSION}"; \
-    test "$(/opt/scanpy/bin/python -c 'import importlib.metadata as md; print(md.version("openpyxl"))')" = "${OPENPYXL_VERSION}"; \
-    test "$(/opt/scanpy/bin/python -c 'import importlib.metadata as md; print(md.version("et-xmlfile"))')" = "${ET_XMLFILE_VERSION}"; \
+    actual="$(/opt/scanpy/bin/python -c 'import importlib.metadata as md; print(md.version("scikit-misc"))')"; test "$actual" = "${SKMISC_VERSION}"; \
+    actual="$(/opt/scanpy/bin/python -c 'import importlib.metadata as md; print(md.version("openpyxl"))')"; test "$actual" = "${OPENPYXL_VERSION}"; \
+    actual="$(/opt/scanpy/bin/python -c 'import importlib.metadata as md; print(md.version("et-xmlfile"))')"; test "$actual" = "${ET_XMLFILE_VERSION}"; \
     /opt/scanpy/bin/python -m pip freeze --all > /opt/scanpy/requirements.freeze.txt
 
 ARG SCANPY_DATASET_CATALOG_SHA256
@@ -116,10 +120,12 @@ ARG SCANPY_HELPER_SHA256
 ARG SCANPY_POLICY_SHA256
 ARG SCANPY_SMOKE_SHA256
 
-COPY docker/scanpy_smoke.py /opt/scanpy/share/testdata/scanpy_smoke.py
-COPY docker/scanpy-prepare-datasets /opt/scanpy/bin/scanpy-prepare-datasets
-COPY docker/scanpy-resource-catalog.json /opt/scanpy/share/scanpy/dataset-catalog.json
-COPY docker/scanpy-sitecustomize.py /opt/scanpy/lib/python3.12/site-packages/sitecustomize.py
+RUN mkdir -p /opt/scanpy/share/testdata /opt/scanpy/share/scanpy \
+    && chmod 0755 /opt /opt/scanpy /opt/scanpy/share /opt/scanpy/share/testdata /opt/scanpy/share/scanpy
+COPY --chmod=0755 docker/scanpy_smoke.py /opt/scanpy/share/testdata/scanpy_smoke.py
+COPY --chmod=0755 docker/scanpy-prepare-datasets /opt/scanpy/bin/scanpy-prepare-datasets
+COPY --chmod=0644 docker/scanpy-resource-catalog.json /opt/scanpy/share/scanpy/dataset-catalog.json
+COPY --chmod=0644 docker/scanpy-sitecustomize.py /opt/scanpy/lib/python3.12/site-packages/sitecustomize.py
 
 RUN set -eux; \
     printf '%s  %s\n' \
@@ -183,9 +189,11 @@ RUN set -eux; \
       'dataset_policy=managed-v1 with persistent verified or explicit unverified roots' \
       > /opt/scanpy/share/doc/scanpy/SOURCE
 
+# Build-time checks are small, non-rendering, offline probes on both native runners.
+# Full graphs, JIT-heavy neighbors, ranked-gene figures and resources run after build.
 RUN set -eux; \
     export PATH="/opt/scanpy/bin:${PATH}"; \
-    test "$(python -c 'import importlib.metadata as md; print(md.version("scanpy"))')" = "${SCANPY_VERSION}"; \
+    actual="$(python -c 'import importlib.metadata as md; print(md.version("scanpy"))')"; test "$actual" = "${SCANPY_VERSION}"; \
     python -c 'import importlib.metadata as md; import scanpy as sc, anndata, et_xmlfile, fast_array_utils, h5py, igraph, leidenalg, matplotlib, natsort, networkx, numba, numpy, openpyxl, pandas, pynndescent, scipy, scverse_misc, seaborn, sklearn, statsmodels, umap; from skmisc.loess import loess; print(md.version("scanpy"))' | grep -Fx "${SCANPY_VERSION}" >/dev/null; \
     scanpy --help 2>&1 | grep -E 'usage:|Usage:' >/dev/null; \
     scanpy settings | grep -F \

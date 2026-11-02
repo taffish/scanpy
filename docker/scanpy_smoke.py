@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata as metadata
+import io
 import sys
 import tempfile
 import warnings
@@ -21,6 +22,7 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 from scipy import sparse
+from scipy.io import mmwrite
 from scanpy.plotting._tools.scatterplots import _get_palette
 
 
@@ -33,7 +35,7 @@ def make_adata() -> AnnData:
     adata = AnnData(counts)
     adata.obs_names = [f"cell_{i:02d}" for i in range(adata.n_obs)]
     adata.var_names = [f"gene_{i:02d}" for i in range(adata.n_vars)]
-    adata.obs["group"] = pd.Categorical(["A"] * 12 + ["B"] * 12)
+    adata.obs["group"] = pd.Categorical(["Group-A"] * 12 + ["Group-B"] * 12)
     adata.layers["counts"] = adata.X.copy()
     return adata
 
@@ -48,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--regressions-only",
         action="store_true",
-        help="run the lightweight Scanpy 1.12.4 regression probes only",
+        help="run lightweight Scanpy 1.12.4 and 1.12.5 regression probes only",
     )
     parser.add_argument(
         "--policy-only",
@@ -65,6 +67,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def check_regressions() -> None:
+    check_125_regressions()
     counts = np.array(
         [[0.0, 0.0], [4.0, 6.0], [8.0, 12.0], [12.0, 18.0]],
         dtype=np.float64,
@@ -94,6 +97,41 @@ def check_regressions() -> None:
         raise RuntimeError("boolean True-subset palette regression failed")
     if _get_palette(false_subset, "flag") != expected:
         raise RuntimeError("boolean False-subset palette regression failed")
+
+
+def check_125_regressions() -> None:
+    """Exercise the patch release with local synthetic inputs only."""
+    with tempfile.TemporaryDirectory(prefix="taf-scanpy-10x-") as temporary:
+        root = Path(temporary)
+        mmwrite(root / "matrix.mtx", sparse.coo_matrix([[1, 2], [3, 4]]))
+        (root / "features.tsv").write_text(
+            "FBgn0036414\tnan\tGene Expression\n001\tGeneB\tGene Expression\n"
+        )
+        (root / "barcodes.tsv").write_text("001\n002\n")
+        for key in ("gene_symbols", "gene_ids"):
+            data = sc.read_10x_mtx(root, var_names=key, compressed=False)
+            assert data.shape == (2, 2)
+            assert list(data.obs_names) == ["001", "002"]
+            if key == "gene_symbols":
+                assert data.var_names[0] == "nan"
+                assert data.var["gene_ids"].iloc[1] == "001"
+            else:
+                assert data.var["gene_symbols"].iloc[0] == "nan"
+    original_logfile = sc.settings.logfile
+    original_verbosity = sc.settings.verbosity
+    try:
+        for kwargs in ({"layer": "counts"}, {"obsm": "rep"}, {}):
+            data = AnnData(np.ones((4, 3)), layers={"counts": np.ones((4, 3))},
+                           obsm={"rep": np.ones((4, 2))})
+            sc.pp.log1p(data)
+            log = io.StringIO()
+            sc.settings.logfile = log
+            sc.settings.verbosity = "warning"
+            sc.pp.log1p(data, **kwargs)
+            assert ("already log-transformed" in log.getvalue()) == (not kwargs)
+    finally:
+        sc.settings.logfile = original_logfile
+        sc.settings.verbosity = original_verbosity
 
 
 def check_moignard_excel() -> None:
@@ -351,7 +389,8 @@ def main() -> int:
     sc.tl.pca(adata, n_comps=5, svd_solver="arpack", random_state=7)
 
     if not args.buildtime:
-        sc.pp.neighbors(adata, n_neighbors=5, n_pcs=5, random_state=7)
+        sc.pp.neighbors(adata, n_neighbors=5, n_pcs=5, random_state=7,
+                        transformer="pynndescent")
         sc.tl.leiden(
             adata,
             resolution=0.5,
@@ -374,7 +413,7 @@ def main() -> int:
                 use_raw=True,
             )
 
-        markers = sc.get.rank_genes_groups_df(adata, group="A")
+        markers = sc.get.rank_genes_groups_df(adata, group="Group-A")
         if markers.empty:
             raise RuntimeError("rank_genes_groups smoke produced no marker table")
         markers.head(10).to_csv(outdir / "markers.tsv", sep="\t", index=False)
@@ -382,6 +421,13 @@ def main() -> int:
         sc.pl.pca(adata, color="group", show=False)
         plt.savefig(outdir / "pca.png", dpi=120, bbox_inches="tight")
         plt.close("all")
+        sc.pl.rank_genes_groups(adata, groups="Group-A", n_genes=5, show=False)
+        plt.savefig(outdir / "ranked-genes.png", dpi=120, bbox_inches="tight")
+        plt.close("all")
+        query = adata[:8].copy()
+        del query.obs["group"]
+        sc.tl.ingest(query, adata, obs="group", embedding_method="pca")
+        assert query.obs["group"].notna().all()
 
     adata.write_h5ad(outdir / "scanpy_smoke.h5ad")
 

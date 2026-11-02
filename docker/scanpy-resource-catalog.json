@@ -1,7 +1,7 @@
 {
   "schema": "taffish.scanpy.dataset-catalog.v1",
-  "app_release": "1.12.4-r1",
-  "scanpy_version": "1.12.4",
+  "app_release": "1.12.5-r1",
+  "scanpy_version": "1.12.5",
   "catalog_scope": "Five fixed remote scanpy.datasets members; generated and wheel-bundled datasets are not duplicated here.",
   "datasets": [
     {

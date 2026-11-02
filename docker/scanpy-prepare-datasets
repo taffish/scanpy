@@ -15,6 +15,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import stat
 import sys
 import tempfile
@@ -24,15 +25,15 @@ import urllib.error
 import urllib.request
 
 
-APP_RELEASE = "1.12.4-r1"
-SCANPY_VERSION = "1.12.4"
+APP_RELEASE = "1.12.5-r1"
+SCANPY_VERSION = "1.12.5"
 CATALOG_PATH = Path(
     os.environ.get(
         "TAFFISH_SCANPY_DATASET_CATALOG",
         "/opt/scanpy/share/scanpy/dataset-catalog.json",
     )
 )
-CATALOG_SHA256 = "7ec2711c801966b85eafae96857a166a70dbc8921a9094b627d65d9aad5f70fd"
+CATALOG_SHA256 = "56e6dcacdb9ce3244fbc25e09e9c88a86e0e85dcf6cbef6119e8f5095b398b53"
 INSTALL_MOUNT = Path("/dataset-install")
 DEFAULT_DATASET_ROOT = INSTALL_MOUNT / SCANPY_VERSION
 RUNTIME_DATASET_ROOT = Path("/datasets/scanpy")
@@ -51,6 +52,18 @@ USER_AGENT = f"taffish-scanpy/{APP_RELEASE} dataset-preparer"
 
 class ResourceError(RuntimeError):
     pass
+
+
+class Interrupted(BaseException):
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+def interrupt(signum, _frame) -> None:
+    # A second signal must not interrupt restoration of the previous member.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise Interrupted(signum)
 
 
 @dataclass(frozen=True)
@@ -287,6 +300,33 @@ def safe_mkdir(path: Path, stop: Path) -> None:
 def fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def directory_identity(path: Path) -> tuple[int, int]:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ResourceError(f"expected a physical directory: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def cleanup_transaction(path: Path, parent_identity: tuple, owned_identity: tuple) -> None:
+    """Remove only this invocation's directory through its verified parent fd."""
+    descriptor = os.open(
+        path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) != parent_identity:
+            raise ResourceError(f"transaction parent changed; retain recovery data: {path}")
+        metadata = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != owned_identity:
+            raise ResourceError(f"transaction identity changed; refuse cleanup: {path}")
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise ResourceError("safe fd-relative transaction cleanup is unavailable")
+        shutil.rmtree(path.name, dir_fd=descriptor)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -1107,8 +1147,11 @@ def install_entry(
                         "for the affected exact dataset after review"
                     )
 
+        staging_identity = directory_identity(staging)
         transaction = Path(tempfile.mkdtemp(prefix="scanpy-txn-", dir=staging))
-        transaction.chmod(0o700)
+        # mkdtemp already creates mode 0700. A redundant chmod can trigger a
+        # copy-up/new inode on shared filesystems and invalidate our ownership ID.
+        transaction_identity = directory_identity(transaction)
         fsync_directory(staging)
         staged_file = transaction / "dataset.source"
         verified_source: VerifiedSource | None = None
@@ -1247,8 +1290,12 @@ def install_entry(
                     file=sys.stderr,
                 )
             else:
-                shutil.rmtree(transaction, ignore_errors=True)
-                fsync_directory(staging)
+                try:
+                    cleanup_transaction(transaction, staging_identity, transaction_identity)
+                except OSError as error:
+                    raise ResourceError(
+                        f"transaction cleanup failed; retain for review: {transaction}: {error}"
+                    ) from error
         print(f"installed={entry.dataset_id}")
         print(f"dataset_root={root}")
 
@@ -1256,7 +1303,7 @@ def install_entry(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare one exact Scanpy 1.12.4 example dataset with fixed identity, "
+            "Prepare one exact Scanpy 1.12.5 example dataset with fixed identity, "
             "or verify an existing prepared root."
         )
     )
@@ -1268,7 +1315,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "prepared version root; installation defaults to /dataset-install/1.12.4, "
+            "prepared version root; installation defaults to /dataset-install/1.12.5, "
             "verification also accepts a read-only mounted root"
         ),
     )
@@ -1315,6 +1362,8 @@ def validate_mode(args: argparse.Namespace) -> None:
 
 def main() -> int:
     os.umask(0o022)
+    signal.signal(signal.SIGINT, interrupt)
+    signal.signal(signal.SIGTERM, interrupt)
     parser = build_parser()
     args = parser.parse_args()
     try:
@@ -1374,6 +1423,13 @@ def main() -> int:
     except ResourceError as error:
         print(f"scanpy-prepare-datasets: error: {error}", file=sys.stderr)
         return 2
+    except Interrupted as error:
+        print(
+            f"scanpy-prepare-datasets: interrupted by signal {error.signum}; "
+            "transaction rollback attempted; retain any reported recovery directory",
+            file=sys.stderr,
+        )
+        return 128 + error.signum
 
 
 if __name__ == "__main__":

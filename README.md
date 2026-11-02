@@ -1,6 +1,6 @@
 # scanpy
 
-`scanpy` packages the official Scanpy 1.12.4 CPU Python environment for
+`scanpy` packages the official Scanpy 1.12.5 CPU Python environment for
 TAFFISH.
 
 Package identity:
@@ -8,24 +8,24 @@ Package identity:
 - name: `scanpy`
 - command: `taf-scanpy`
 - kind: `tool`
-- version: `1.12.4-r1`
-- image: `ghcr.io/taffish/scanpy:1.12.4-r1`
+- version: `1.12.5-r1`
+- image: `ghcr.io/taffish/scanpy:1.12.5-r1`
 - platforms: native `linux/amd64` and `linux/arm64`
 - app license: Apache-2.0
-- upstream: [scverse/scanpy 1.12.4](https://github.com/scverse/scanpy/releases/tag/1.12.4)
+- upstream: [scverse/scanpy 1.12.5](https://github.com/scverse/scanpy/releases/tag/1.12.5)
 
 ## Installation
 
 Install this exact release from the TAFFISH Hub:
 
 ```sh
-taf install scanpy 1.12.4-r1
+taf install scanpy 1.12.5-r1
 ```
 
 ## What This App Packages
 
 Scanpy is a Python toolkit for single-cell gene-expression analysis using the
-AnnData data model. This image installs the official 1.12.4 wheel with the
+AnnData data model. This image installs the official 1.12.5 wheel with the
 official `leiden` and `skmisc` extras:
 
 - `igraph` and `leidenalg` for Leiden clustering;
@@ -89,6 +89,16 @@ taf-scanpy python -c '"import importlib.metadata as md; print(md.version(\"scanp
 The outer literal quotes in the `python -c` example are intentionally passed
 through TAFFISH automatic command mode. Prefer a script file for multiline
 analysis.
+
+Automatic command mode needs quote characters to survive the host shell when
+an argument contains spaces. For example:
+
+```sh
+taf-scanpy python analysis.py "'input with spaces.h5ad'" "'output with spaces.h5ad'"
+```
+
+This applies to analysis arguments, not resource-root environment variables:
+resource roots have the stricter path restrictions documented below.
 
 ## Minimal Analysis Script
 
@@ -173,7 +183,7 @@ Core analysis does not require a model, taxonomy, reference database, or
 external dataset. Optional examples are governed as independent resource
 members rather than as one undifferentiated Scanpy bundle:
 
-| Resource surface | TAFFISH 1.12.4-r1 treatment |
+| Resource surface | TAFFISH 1.12.5-r1 treatment |
 | --- | --- |
 | `blobs` | Generated locally; no download or shared resource. |
 | `krumsiek11`, `toggleswitch`, `pbmc68k_reduced` | Already distributed inside the official Scanpy wheel; no separate helper action. |
@@ -184,9 +194,9 @@ members rather than as one undifferentiated Scanpy bundle:
 | `scanpy.queries` | Unsupported in this image because the optional `pybiomart` and `gprofiler-official` clients are absent; those services also evolve independently of this release. |
 
 The classification follows the public
-[Scanpy 1.12.4 dataset source](https://github.com/scverse/scanpy/blob/1.12.4/src/scanpy/datasets/_datasets.py).
+[Scanpy 1.12.5 dataset source](https://github.com/scverse/scanpy/blob/1.12.5/src/scanpy/datasets/_datasets.py).
 The fixed catalog SHA256 is
-`7ec2711c801966b85eafae96857a166a70dbc8921a9094b627d65d9aad5f70fd`.
+`56e6dcacdb9ce3244fbc25e09e9c88a86e0e85dcf6cbef6119e8f5095b398b53`.
 The audited member identities are:
 
 | Member/file | Bytes | SHA256 |
@@ -231,13 +241,13 @@ not turn an ordinary analysis invocation into an implicit download session.
 `TAFFISH_SCANPY_DATASET_INSTALL_ROOT` is a host parent directory mounted
 read-write only for explicit preparation. Inside the container it is
 `/dataset-install`; the helper atomically prepares the version root
-`/dataset-install/1.12.4`, records the catalog identity and per-member hashes,
+`/dataset-install/1.12.5`, records the catalog identity and per-member hashes,
 and supports an explicit verification pass:
 
 ```sh
 TAFFISH_SCANPY_DATASET_INSTALL_ROOT="$ROOT" \
   taf-scanpy scanpy-prepare-datasets --verify-only \
-  --dataset-root /dataset-install/1.12.4
+  --dataset-root /dataset-install/1.12.5
 ```
 
 The helper serializes writers with a version lock and keeps resumable download
@@ -257,7 +267,7 @@ snapshot before repair. Disable discovery during both verification and repair:
 TAFFISH_SCANPY_DATASET_AUTO_MOUNT=0 \
 TAFFISH_SCANPY_DATASET_INSTALL_ROOT="$ROOT" \
   taf-scanpy scanpy-prepare-datasets --verify-only \
-  --dataset-root /dataset-install/1.12.4
+  --dataset-root /dataset-install/1.12.5
 ```
 
 If verification fails, prefix the same exact `--dataset ... --force`
@@ -268,7 +278,7 @@ before verification because it can contain the only rollback copy.
 
 After deep verification succeeds and no helper process is active, an
 administrator may also remove the selected member's resumable cache file under
-`$ROOT/.taffish-scanpy/cache/1.12.4/` (`.source` or `.part`) to reclaim space;
+`$ROOT/.taffish-scanpy/cache/1.12.5/` (`.source` or `.part`) to reclaim space;
 do not remove a retained failed transaction. A later download will need network
 access again.
 
@@ -292,8 +302,8 @@ proves identity, not permission; the caller remains responsible for
 authorization.
 
 For one site copy, an administrator prepares either
-`/usr/local/share/taffish/datasets/scanpy/1.12.4` or
-`/opt/taffish/datasets/scanpy/1.12.4`, verifies it, then makes the completed
+`/usr/local/share/taffish/datasets/scanpy/1.12.5` or
+`/opt/taffish/datasets/scanpy/1.12.5`, verifies it, then makes the completed
 tree root-owned and read-only for ordinary users. A representative setup is:
 
 ```sh
@@ -302,13 +312,12 @@ sudo chown "$(id -u):$(id -g)" /usr/local/share/taffish/datasets/scanpy
 TAFFISH_SCANPY_ALLOW_NETWORK=1 \
 TAFFISH_SCANPY_DATASET_INSTALL_ROOT=/usr/local/share/taffish/datasets/scanpy \
   taf-scanpy scanpy-prepare-datasets --dataset pbmc3k-raw
-sudo chown -R root:root /usr/local/share/taffish/datasets/scanpy/1.12.4
-sudo chmod -R a+rX /usr/local/share/taffish/datasets/scanpy/1.12.4
+sudo chown -R root:root /usr/local/share/taffish/datasets/scanpy/1.12.5
+sudo chmod -R a+rX /usr/local/share/taffish/datasets/scanpy/1.12.5
 sudo chown root:root /usr/local/share/taffish/datasets/scanpy
 ```
 
-This is the administrator-once/ordinary-user-read-only contract; a production
-site installation was not exercised on this development host. Docker normally
+This is the administrator-once/ordinary-user-read-only contract. Docker normally
 creates prepared files as container root; ordinary users can read the final
 `a+rX` tree, while an administrator must perform later cleanup or forced
 replacement. Rootless Podman and Apptainer normally retain caller ownership.
@@ -336,9 +345,9 @@ TAFFISH_CONTAINER_BACKEND=podman taf-scanpy python analysis.py
 TAFFISH_CONTAINER_BACKEND=apptainer taf-scanpy python analysis.py
 ```
 
-Docker and Podman prepared-root behavior is a required runtime validation gate
-before publish. Apptainer uses the same wrapper contract but is compile-checked
-only on this host because no Apptainer runtime is installed.
+Prepared-root behavior and actual installation are runtime acceptance gates on
+Docker, Podman and Apptainer, including native xjp verification. See Testing
+for the evidence boundary; generated commands alone are not acceptance.
 
 Docker and Podman run ordinary wrapper invocations with `--network=none` by
 default. On all backends the packaged Python policy also blocks implicit
@@ -348,19 +357,19 @@ unsuitable, disable it and bind a verified version root manually as read-only:
 ```sh
 docker run --rm -v "$PWD:/work" -w /work \
   --network none \
-  -v /host/scanpy/1.12.4:/datasets/scanpy:ro \
+  -v /host/scanpy/1.12.5:/datasets/scanpy:ro \
   -e TAFFISH_SCANPY_DATASET_ROOT=/datasets/scanpy \
   -e TAFFISH_SCANPY_DATASETDIR=/datasets/scanpy \
-  ghcr.io/taffish/scanpy:1.12.4-r1 python analysis.py
+  ghcr.io/taffish/scanpy:1.12.5-r1 python analysis.py
 podman run --rm -v "$PWD:/work" -w /work \
   --network none \
-  -v /host/scanpy/1.12.4:/datasets/scanpy:ro \
+  -v /host/scanpy/1.12.5:/datasets/scanpy:ro \
   -e TAFFISH_SCANPY_DATASET_ROOT=/datasets/scanpy \
   -e TAFFISH_SCANPY_DATASETDIR=/datasets/scanpy \
-  ghcr.io/taffish/scanpy:1.12.4-r1 python analysis.py
-apptainer exec --bind /host/scanpy/1.12.4:/datasets/scanpy:ro \
+  ghcr.io/taffish/scanpy:1.12.5-r1 python analysis.py
+apptainer exec --bind /host/scanpy/1.12.5:/datasets/scanpy:ro \
   --env TAFFISH_SCANPY_DATASET_ROOT=/datasets/scanpy,TAFFISH_SCANPY_DATASETDIR=/datasets/scanpy \
-  docker://ghcr.io/taffish/scanpy:1.12.4-r1 python analysis.py
+  docker://ghcr.io/taffish/scanpy:1.12.5-r1 python analysis.py
 ```
 
 When an EBI accession or legacy Visium example truly must be fetched directly,
@@ -385,8 +394,8 @@ The wrapper mounts that directory read-write at `/dataset-download`; these
 responses have no app-fixed checksum, stable member inventory, or uniform
 resource license and are therefore deliberately marked unverified and
 nonreproducible. Freeze and independently authorize the resulting files before
-scientific reuse. Docker/Podman are required runtime gates; the Apptainer form
-is a compile-checked contract only on this host.
+scientific reuse. The same persistent-mount and policy contract is tested on
+Docker, Podman and Apptainer; no live EBI/Visium research download is implied.
 
 Local-input analysis remains offline. Other Python libraries can implement
 their own network clients, so the Scanpy fail-closed policy is not a general
@@ -394,7 +403,7 @@ container firewall on Apptainer; use site network isolation when required.
 
 ## GUI and Companion Routing
 
-The 1.12.4 package declares only `scanpy = scanpy.cli:console_main`; its
+The 1.12.5 package declares only `scanpy = scanpy.cli:console_main`; its
 `Framework :: Jupyter` classifier does not install a notebook or server.
 Jupyter is therefore a separate long-running service boundary, not a hidden
 GUI in this image.
@@ -420,7 +429,7 @@ be made as a new release or dedicated app after dependency, architecture,
 license, and smoke review; mutating the published environment with `pip
 install` is not a reproducible workflow.
 
-The 1.12.4 Scrublet bug fix is therefore upstream behavior outside this
+The inherited 1.12.4 Scrublet bug fix is therefore upstream behavior outside this
 release's packaged extra and is not claimed as tested here.
 
 ## Troubleshooting
@@ -435,7 +444,9 @@ release's packaged extra and is not claimed as tested here.
   rejected instead of falling back.
 - A fixed example is missing: use `scanpy-prepare-datasets` for
   `burczynski06`, `pbmc3k-raw`, or `pbmc3k-processed`; import `moignard15` or
-  `paul15` only from an independently authorized local copy.
+  `paul15` only from an independently authorized local copy. A `FileExistsError`
+  naming `TAFFISH_IMPLICIT_DATASET_DOWNLOADS_DISABLED` is the intentional
+  no-prepared-root guard, before a dataset download is attempted.
 - A Visium or EBI call is blocked: prefer an authorized frozen local input, or
   use the documented persistent double opt-in and treat the result as
   unverified. Fixed helper members remain blocked on that route. Query clients
@@ -451,12 +462,14 @@ release's packaged extra and is not claimed as tested here.
 ## Testing
 
 The independent offline smoke contract covers exact package/provenance
-identity, the built-in CLI/settings surface, direct imports, and three 1.12.4
+identity, the built-in CLI/settings surface, direct imports, and three inherited 1.12.4
 regressions: dense/CSR normalization with zero-count cells, CSR normalization
 with `NUMBA_DISABLE_JIT=1`, and stable boolean-category colors after
 subsetting. A synthetic workflow covers Seurat-v3 HVG selection,
 normalization/logging, PCA, neighbors, Leiden, marker testing, H5AD/TSV output,
-and a static PNG.
+and static PNGs. Added 1.12.5 probes exercise literal nan/string IDs in 10x
+input, log1p warning scope, explicit pynndescent neighbors/ingest and a scalar
+string group in ranked-gene plots. No upstream algorithm is patched.
 
 Dockerfile build-time checks run only identity, imports, ordinary help/settings,
 the normalization/color and offline Moignard XLSX probes, helper catalog and
@@ -472,8 +485,69 @@ read-only reuse, and the EBI/Visium-only unverified policy. These fixtures do
 not claim a privileged production site installation.
 
 These tests do not establish scientific correctness on production data,
-production-scale performance, online dataset integrity, every optional extra,
+production-scale performance, evolving online dataset integrity, every optional extra,
 GPU behavior, or a GUI/browser service.
+
+The 2026-10-30 final candidate passed native amd64 and arm64 builds using the
+current canonical BuildKit. The Action is unchanged and byte-identical to the
+fresh current taf new template. Runtime coverage is separate from the build:
+
+| Native environment | Fresh offline checks | Real wrapper checks | Additional resource/permission checks |
+| --- | --- | --- | --- |
+| ARM64 Docker | 26, including read-only non-root | 40 | 15 |
+| ARM64 Podman | 26, including read-only non-root | 40 | 15 |
+| xjp AMD64 Docker | 26, including read-only non-root | 42 | 15 |
+| xjp AMD64 Podman | 26, including read-only non-root | 42 | 15 |
+| xjp AMD64 Apptainer | 13, fresh contained read-only SIF | 42 | 13 |
+
+The SIF comes from the same tested amd64 image archive. All three xjp backends
+performed an actual fixed PBMC3k member download, zero-byte partial recovery
+and an idempotent second install. Separate synthetic transaction tests cover
+rollback, retained old resources, parent/symlink races and cleanup failures.
+Both images retain 133 upstream Scanpy files byte-for-byte from the official
+wheel. The final wrapper's native static figures were visually inspected.
+
+Docker-reported uncompressed image sizes are 750,481,166 bytes (715.7 MiB,
+amd64) and 785,081,884 bytes (748.7 MiB, arm64). The main contributors are
+LLVM/llvmlite, SciPy and the other scientific runtime packages; build compilers
+and download caches are absent. Removing those runtime packages would remove
+supported functionality, so no further aggressive size reduction is applied.
+These are local candidate results, not a claim that the public CI, Release,
+GHCR image or Index has already been published and verified.
+
+With an explicitly read-only HOME, Matplotlib may report that it created a
+temporary cache under `/tmp`. The tested fallback is harmless; a site needing
+persistent font-cache reuse can provide a writable `MPLCONFIGDIR` through its
+normal container environment/mount policy.
+
+### Dependency Drift and Resource Recovery
+
+The selected wheel/source/base identities are fixed, but Debian repository
+availability and transitive PyPI resolution remain live. The installed
+dependency receipt describes the tested image, not a promise of permanently
+byte-identical rebuilds. Retry transport errors without weakening hashes.
+
+Resource startup uses the installer's full root validator before importing
+Scanpy. SIGINT and SIGTERM request rollback and return 130 and 143; cleanup
+failure returns nonzero with a diagnostic. Only the transaction created by
+the current invocation is cleaned, using verified directory identities and a
+symlink-resistant parent descriptor. Old recovery directories are not removed.
+An uncatchable kill/power failure can retain a transaction. An extremely early
+signal before the newly created directory is returned can also leave an empty
+staging directory whose ownership the interrupted process cannot prove. The
+helper does not sweep old directories by prefix: preserve them and follow the
+verification/repair procedure above. A persistent flock lock file is normal;
+the operating system releases the lock when its process ends.
+
+For a deliberately hardened Apptainer invocation using `--no-mount bind-paths`,
+that option also removes the resolver bind. Explicit online preparation may
+need `--bind /etc/resolv.conf:/etc/resolv.conf:ro` in
+`TAFFISH_APPTAINER_RUN_ARGS`; keep the other isolation flags. This is not needed
+for ordinary offline analysis and does not enable implicit dataset downloads.
+
+Resources are versioned: do not rename a 1.12.4 root or edit its receipts into
+1.12.5. Prepare the new root from an independently verified local source or
+the catalog helper, retaining the old root until no longer needed.
 
 ## License and Citation
 
