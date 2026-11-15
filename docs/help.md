@@ -1,4 +1,4 @@
-scanpy 1.12.5-r1
+scanpy 1.13.0-r1
 
 Purpose:
   Run CPU/headless Scanpy Python analysis on local single-cell data.
@@ -14,7 +14,9 @@ Common tasks:
 
 Inputs and outputs:
   Supply a Python script and local H5AD/10x/Matrix Market data as it requires.
-  Scripts choose output H5AD, TSV/CSV and static PNG/SVG/PDF paths.
+  Scripts choose output H5AD, TSV/CSV and PNG/SVG/PDF or interactive HTML paths.
+  Preview HTML: follow the short plot.py example in the README, run
+  taf-scanpy python plot.py and open pca.html locally. No server or port.
   Existing output handling belongs to the script; choose a new output directory.
 
 Dataset safety:
@@ -26,11 +28,11 @@ Prepare one fixed dataset:
   taf-scanpy scanpy-prepare-datasets --list-datasets
   taf-scanpy scanpy-prepare-datasets --dataset pbmc3k-raw --dry-run
   ROOT="$HOME/.local/share/taffish/datasets/scanpy"; mkdir -p "$ROOT"
-  Docker: TAFFISH_CONTAINER_BACKEND=docker TAFFISH_SCANPY_ALLOW_NETWORK=1 \
+  TAFFISH_CONTAINER_BACKEND=docker TAFFISH_SCANPY_ALLOW_NETWORK=1 \
     TAFFISH_SCANPY_DATASET_INSTALL_ROOT="$ROOT" taf-scanpy scanpy-prepare-datasets --dataset pbmc3k-raw
-  Podman: TAFFISH_CONTAINER_BACKEND=podman TAFFISH_SCANPY_ALLOW_NETWORK=1 \
+  TAFFISH_CONTAINER_BACKEND=podman TAFFISH_SCANPY_ALLOW_NETWORK=1 \
     TAFFISH_SCANPY_DATASET_INSTALL_ROOT="$ROOT" taf-scanpy scanpy-prepare-datasets --dataset pbmc3k-raw
-  Apptainer: TAFFISH_CONTAINER_BACKEND=apptainer TAFFISH_SCANPY_ALLOW_NETWORK=1 \
+  TAFFISH_CONTAINER_BACKEND=apptainer TAFFISH_SCANPY_ALLOW_NETWORK=1 \
     TAFFISH_SCANPY_DATASET_INSTALL_ROOT="$ROOT" taf-scanpy scanpy-prepare-datasets --dataset pbmc3k-raw
   Automatic members: burczynski06, pbmc3k-raw, pbmc3k-processed. Select only one.
   moignard15/paul15 need an independently authorized file under "$ROOT/imports":
@@ -39,9 +41,9 @@ Prepare one fixed dataset:
     --confirm-authorized-local-import
 
 Find and share resources:
-  The helper creates "$ROOT/1.12.5". Personal discovery uses
-  ~/.local/share/taffish/datasets/scanpy/1.12.5; site discovery uses
-  /usr/local/share/taffish/datasets/scanpy/1.12.5, then /opt/taffish/datasets/scanpy/1.12.5.
+  The helper creates "$ROOT/1.13.0". Personal discovery uses
+  ~/.local/share/taffish/datasets/scanpy/1.13.0; site discovery uses
+  /usr/local/share/taffish/datasets/scanpy/1.13.0, then /opt/taffish/datasets/scanpy/1.13.0.
   An administrator can prepare once and grant read/traverse access to all users;
   no ordinary-user download is needed. Full setup and permissions: README.
   Host resource paths cannot contain whitespace, commas, colons or * ? [ ].
@@ -51,12 +53,11 @@ Find and share resources:
   TAFFISH_CONTAINER_BACKEND=apptainer TAFFISH_SCANPY_DATASET_PATH=/host/version/root taf-scanpy python analysis.py
   TAFFISH_SCANPY_DATASET_AUTO_MOUNT=0 disables discovery and explicit root use.
   Missing/corrupt roots fail; they never silently trigger a replacement download.
-  FileExistsError mentioning TAFFISH_IMPLICIT_DATASET_DOWNLOADS_DISABLED means
-  that no prepared root is selected: prepare/select a resource before that call.
+  For a missing fixed member, prepare it first. Do not rename an old version root.
 
 Verify or recover:
   TAFFISH_SCANPY_DATASET_AUTO_MOUNT=0 TAFFISH_SCANPY_DATASET_INSTALL_ROOT="$ROOT" \
-    taf-scanpy scanpy-prepare-datasets --verify-only --dataset-root /dataset-install/1.12.5
+    taf-scanpy scanpy-prepare-datasets --verify-only --dataset-root /dataset-install/1.13.0
   Keep any reported recovery directory. Review the source, then add --force to
   the same exact-member install command; disable auto-mount while repairing.
   Never remove another member or an old recovery directory to bypass a failure.

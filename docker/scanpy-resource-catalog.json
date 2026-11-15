@@ -1,12 +1,12 @@
 {
   "schema": "taffish.scanpy.dataset-catalog.v1",
-  "app_release": "1.12.5-r1",
-  "scanpy_version": "1.12.5",
+  "app_release": "1.13.0-r1",
+  "scanpy_version": "1.13.0",
   "catalog_scope": "Five fixed remote scanpy.datasets members; generated and wheel-bundled datasets are not duplicated here.",
   "datasets": [
     {
       "id": "burczynski06",
-      "relative_path": "burczynski06/GDS1615_full.soft.gz",
+      "relative_path": "burczynski06.soft.gz",
       "url": "https://exampledata.scverse.org/scanpy/GDS1615_full.soft.gz",
       "expected_bytes": 16295674,
       "sha256": "86126c1a3c163ea20abb14c1a9711aaff34e6c492ef6dd86298bbaf18cc3f5f3",
@@ -21,7 +21,7 @@
     },
     {
       "id": "moignard15",
-      "relative_path": "moignard15/nbt.3154-S3.xlsx",
+      "relative_path": "moignard15.xlsx",
       "url": "https://exampledata.scverse.org/scanpy/41587_2015_BFnbt3154_MOESM4_ESM.xlsx",
       "expected_bytes": 3402603,
       "sha256": "e7b358fef2b6da115b7ee3ab4c7fc55fd80e210bba427902e4afc9118992747c",
@@ -36,7 +36,7 @@
     },
     {
       "id": "paul15",
-      "relative_path": "paul15/paul15.h5",
+      "relative_path": "paul15.h5",
       "url": "https://exampledata.scverse.org/scanpy/paul15.h5",
       "expected_bytes": 10297693,
       "sha256": "6161984f758dd464992edc23f1a8ab89b2081600130c6aa93a1ab12b3ada5bfb",

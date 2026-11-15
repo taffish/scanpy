@@ -23,7 +23,7 @@ import scanpy as sc
 from anndata import AnnData
 from scipy import sparse
 from scipy.io import mmwrite
-from scanpy.plotting._tools.scatterplots import _get_palette
+from scanpy.plotting.legacy._tools.scatterplots import _get_palette
 
 
 def make_adata() -> AnnData:
@@ -148,20 +148,13 @@ def check_moignard_excel() -> None:
 
     with tempfile.TemporaryDirectory(prefix="taf-scanpy-moignard-") as temporary:
         dataset_root = Path(temporary)
-        workbook = dataset_root / "moignard15" / "nbt.3154-S3.xlsx"
-        workbook.parent.mkdir(parents=True)
+        workbook = dataset_root / "moignard15.xlsx"
         frame.to_excel(workbook, sheet_name="dCt_values.txt", index=False)
 
-        original_datasetdir = sc.settings.datasetdir
-        try:
-            sc.settings.datasetdir = dataset_root
-            with patch(
-                "scanpy.readwrite._download",
-                side_effect=RuntimeError("offline regression attempted a download"),
-            ):
-                adata = sc.datasets.moignard15()
-        finally:
-            sc.settings.datasetdir = original_datasetdir
+        # Substitute only the fixed file locator for this synthetic workbook;
+        # the real reader and its gene filtering still run unmodified.
+        with patch("scanpy.datasets._datasets.fetch_dataset", return_value=workbook):
+            adata = sc.datasets.moignard15()
 
     if adata.shape != (533, 2):
         raise RuntimeError(f"moignard15 XLSX shape regression failed: {adata.shape}")
@@ -180,56 +173,19 @@ def check_dataset_policy() -> None:
     if sc.settings.datasetdir != sentinel or not sentinel.is_file():
         raise RuntimeError("TAFFISH Scanpy datasetdir fail-closed policy is not active")
 
-    import scanpy._utils as scanpy_utils
-
-    with tempfile.TemporaryDirectory(prefix="taf-scanpy-prepared-member-") as temporary:
-        prepared = Path(temporary) / "paul15.h5"
-        prepared.write_bytes(b"taffish-prepared-member-policy-probe\n")
-        scanpy_utils.check_presence_download(
-            prepared,
-            "https://exampledata.scverse.org/scanpy/paul15.h5",
-        )
-        try:
-            scanpy_utils.check_presence_download(
-                Path(temporary) / "missing-paul15.h5",
-                "https://exampledata.scverse.org/scanpy/paul15.h5",
-            )
-        except RuntimeError as error:
-            if "implicit Scanpy dataset download blocked by TAFFISH" not in str(error):
-                raise
-        else:
-            raise RuntimeError("missing prepared member did not fail before download")
-
-    calls = (
-        ("pbmc3k", sc.datasets.pbmc3k),
-        (
-            "ebi-expression-atlas",
-            lambda: sc.datasets.ebi_expression_atlas("TAFFISH-NO-NET"),
-        ),
-        ("visium-sge", sc.datasets.visium_sge),
-    )
-    with (
-        patch(
-            "scanpy.readwrite._download",
-            side_effect=RuntimeError("network download path was reached"),
-        ),
-        patch(
-            "scanpy.datasets._ebi_expression_atlas.sniff_url",
-            side_effect=RuntimeError("EBI network path was reached"),
-        ),
-        patch(
-            "scanpy.datasets._datasets._download_visium_dataset",
-            side_effect=RuntimeError("Visium network path was reached"),
-        ),
-    ):
-        for label, call in calls:
+    calls = (sc.datasets.pbmc3k, sc.datasets.pbmc3k_processed,
+             sc.datasets.moignard15, sc.datasets.paul15, sc.datasets.burczynski06,
+             lambda: sc.datasets.ebi_expression_atlas("TAFFISH-NO-NET"),
+             sc.datasets.visium_sge)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("unexpected network lookup")):
+        for call in calls:
             try:
                 call()
-            except (FileExistsError, NotADirectoryError):
-                continue
             except RuntimeError as error:
-                raise RuntimeError(f"{label} did not fail before network access: {error}") from error
-            raise RuntimeError(f"{label} did not fail closed without a prepared root")
+                if "implicit Scanpy dataset download blocked by TAFFISH" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("dataset did not fail closed")
 
     original_datasetdir = sc.settings.datasetdir
     try:
@@ -298,11 +254,11 @@ def check_unverified_dataset_policy() -> None:
             existing_root = Path(temporary_base) / "datasets"
             existing_root.mkdir()
             fixed_paths = (
-                Path("burczynski06/GDS1615_full.soft.gz"),
+                Path("burczynski06.soft.gz"),
                 Path("pbmc3k_raw.h5ad"),
                 Path("pbmc3k_processed.h5ad"),
-                Path("moignard15/nbt.3154-S3.xlsx"),
-                Path("paul15/paul15.h5"),
+                Path("moignard15.xlsx"),
+                Path("paul15.h5"),
             )
             for relative_path in fixed_paths:
                 fixed_path = existing_root / relative_path
@@ -333,7 +289,7 @@ def check_unverified_dataset_policy() -> None:
                     )
 
             with patch(
-                "urllib.request.urlopen",
+                "pooch.create",
                 side_effect=RuntimeError("visium-network-probe-reached"),
             ):
                 try:
@@ -428,6 +384,33 @@ def main() -> int:
         del query.obs["group"]
         sc.tl.ingest(query, adata, obs="group", embedding_method="pca")
         assert query.obs["group"].notna().all()
+
+    if not args.buildtime:
+        import holoviews as hv
+        from bokeh.embed import file_html
+        from bokeh.model import Model
+        from bokeh.resources import INLINE
+        view = make_adata()
+        with sc.settings.override(preset=sc.Preset.ScanpyV2Preview):
+            A = sc.pl.hv_init("bokeh")
+            sc.pp.pca(view, n_comps=3)
+            plot = sc.pl.pca(view, color=A.obs["group"]).opts(
+                tools=["hover", "box_zoom", "reset", "save"], aspect=None,
+                data_aspect=None, responsive=True,
+                height=420, title="Scanpy PCA")
+            figure = hv.render(plot, backend="bokeh")
+            if figure.sizing_mode != "stretch_width":
+                raise RuntimeError(f"preview is not width-responsive: {figure.sizing_mode}")
+            # This export runs in a dedicated script. The plain Bokeh figure has
+            # no Panel models; do not serialize unrelated registered extensions.
+            if not all(type(model).__module__.startswith("bokeh.") for model in figure.references()):
+                raise RuntimeError("standalone PCA unexpectedly requires an extension")
+            Model.clear_extensions()
+            (outdir / "pca-interactive.html").write_text(
+                file_html(figure, INLINE, "Scanpy PCA"), encoding="utf-8"
+            )
+        if sc.settings.preset is sc.Preset.ScanpyV2Preview:
+            raise RuntimeError("preview settings leaked into the default workflow")
 
     adata.write_h5ad(outdir / "scanpy_smoke.h5ad")
 
